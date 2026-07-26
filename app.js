@@ -281,6 +281,55 @@ class GeMBiddingDataExtractor {
         console.log('=== END DEBUG ===');
     }
 
+    // NEW: buildPageTextWithLines - Reconstructs real line breaks from PDF.js text items
+    // using their Y coordinates, instead of flattening an entire page into one line.
+    // GeM bid PDFs are tables, and the Item Category / Technical Specifications values
+    // sit on their own line below the field label - without this, all extraction that
+    // relies on line-by-line boundaries (stop patterns, section scanning) silently
+    // operates on one giant blob per page and fails to isolate the right fields.
+    buildPageTextWithLines(items) {
+        if (!items || items.length === 0) return '';
+
+        const yTolerance = 2; // points; items within this Y range are treated as same line
+
+        // Sort by Y (descending - PDF coordinate origin is bottom-left, so higher Y = higher on page),
+        // then by X for left-to-right reading order within a line
+        const sorted = [...items].sort((a, b) => {
+            const yDiff = b.transform[5] - a.transform[5];
+            if (Math.abs(yDiff) > yTolerance) return yDiff;
+            return a.transform[4] - b.transform[4];
+        });
+
+        const lines = [];
+        let currentLine = [];
+        let currentY = null;
+
+        for (const item of sorted) {
+            const y = item.transform[5];
+            if (currentY === null || Math.abs(y - currentY) <= yTolerance) {
+                currentLine.push(item);
+                currentY = currentY === null ? y : currentY;
+            } else {
+                lines.push(currentLine);
+                currentLine = [item];
+                currentY = y;
+            }
+        }
+        if (currentLine.length > 0) lines.push(currentLine);
+
+        return lines
+            .map(lineItems =>
+                lineItems
+                    .sort((a, b) => a.transform[4] - b.transform[4])
+                    .map(it => it.str)
+                    .join(' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+            )
+            .filter(l => l.length > 0)
+            .join('\n');
+    }
+
     async extractDataFromPDF(file) {
         try {
             if (typeof pdfjsLib === 'undefined') {
@@ -304,7 +353,10 @@ class GeMBiddingDataExtractor {
                     
                     // Get text content
                     const pageTextContent = await page.getTextContent();
-                    const pageTextStr = pageTextContent.items.map(item => item.str).join(' ');
+                    // IMPORTANT: build real per-row lines from item Y-coordinates rather than
+                    // flattening the whole page into a single line - table field values (Item
+                    // Category, Technical Specifications) live on their own line below the label
+                    const pageTextStr = this.buildPageTextWithLines(pageTextContent.items);
                     fullText += pageTextStr + '\n';
                     
                     // Helper function to get text context around a position
@@ -1211,11 +1263,11 @@ class GeMBiddingDataExtractor {
         // Fallback: Look for traditional quantity patterns
         const quantityPatterns = [
             /Total\s+Quantity\/कुल\s+मात्रा\s*[:\-]?\s*(\d+)/i,
-            /Total\s+Quantity.*?[:\-]?\s*(\d{2,6})/i,
+            /Total\s+Quantity[\s\S]{0,20}?[:\-]?\s*(\d{2,6})/i,
             /कुल\s+मात्रा\s*[:\-]?\s*(\d+)/i,
-            /Quantity.*?[:\-]?\s*(\d{2,6})/i,
-            /Total\s+Qty.*?[:\-]?\s*(\d+)/i,
-            /Qty.*?[:\-]?\s*(\d+)/i
+            /Quantity[\s\S]{0,20}?[:\-]?\s*(\d{2,6})/i,
+            /Total\s+Qty[\s\S]{0,20}?[:\-]?\s*(\d+)/i,
+            /Qty[\s\S]{0,20}?[:\-]?\s*(\d+)/i
         ];
         
         for (const pattern of quantityPatterns) {
@@ -1231,223 +1283,221 @@ class GeMBiddingDataExtractor {
         return 'Not Found';
     }
 
-    // IMPROVED: extractItemCategory - Better extraction of specific product names like "Schneider Electric Compact"
+    // REWRITTEN (v2): extractItemCategory - The "Item Category" field in a real GeM bid
+    // table is a single value that sits on its own line right below the "Item Category"
+    // label (e.g. "MCB - Miniature Circuit - Breakers for A.C. Operation as per IS / IEC
+    // 60898 (Part 1) (Q2)" or "Occupancy sensor (Q3)") - it is NOT a multi-row section.
+    // This only works correctly once the PDF text has real line breaks (see
+    // buildPageTextWithLines), since the very next table row ("MSE Relaxation for Years
+    // of Experience and Turnover") is what bounds the value.
     extractItemCategory(text) {
-        const lines = text.split('\n');
-        const items = [];
-        
-        // Look for the actual item list section
-        let inItemSection = false;
-        let foundItems = false;
-        
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+        // Lines that mark the START of the field (label line)
+        const labelIsStart = (line) => line.includes('Item Category') || line.includes('मद केटेगरी');
+
+        // Lines that mark the row immediately AFTER Item Category in the standard GeM
+        // bid template - used to know where the value ends
+        const labelIsStop = (line) =>
+            line.includes('MSE Relaxation') ||
+            line.includes('एमएसएमई') ||
+            line.includes('Startup Relaxation') ||
+            line.includes('स्टाट%अप') ||
+            line.includes('टाट%अप');
+
+        let labelLineIdx = -1;
         for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            
-            // Look for the start of actual item specifications
-            if (line.includes('Item Category/') || 
-                line.includes('मद केटेगरी') ||
-                line.includes('VARIOUS TYPES OF ELECTRICAL SPARES') ||
-                line.includes('CIRCUIT BREAKER') ||
-                line.includes('Schneider Electric') ||
-                line.includes('Bid Details') && line.includes('बिड विवरण')) {
-                
-                inItemSection = true;
-                console.log('Found item section at line:', i, 'Content:', line);
-                continue;
-            }
-            
-            if (inItemSection) {
-                const lineClean = line.trim();
-                
-                // Stop when we hit policy sections or other non-item content
-                if (['Experience Criteria', 'Preference to Make In India', 'Purchase preference for MSEs', 
-                     'Estimated Bid Value', 'Past Performance', 'Technical Specifications',
-                     'Consignees/Reporting Officer', 'Buyer Added Bid', 'Input Tax Credit',
-                     'EMD Detail', 'Evaluation Method', 'Inspection Required', 'Advisory',
-                     'Searched Strings', 'Relevant Categories', 'MSE Exemption'].some(stop => 
-                     lineClean.includes(stop))) {
-                    console.log('Stopping at line:', i, 'due to:', lineClean);
-                    break;
-                }
-                
-                // Skip empty lines, page numbers, and noise
-                if (lineClean && 
-                    !/^\d+\s*\/\s*\d+$/.test(lineClean) &&
-                    !lineClean.includes('GeMARPTS') &&
-                    !lineClean.includes('Strings used in') &&
-                    !lineClean.includes('Result generated') &&
-                    !lineClean.includes('Categories selected') &&
-                    !lineClean.startsWith('मम') &&
-                    !lineClean.startsWith('अधिसूचना') &&
-                    lineClean.length > 10 &&
-                    !lineClean.includes('Policy') &&
-                    !lineClean.includes('criteria') &&
-                    !lineClean.includes('preference') &&
-                    !lineClean.includes('percentage') &&
-                    !lineClean.includes('registration') &&
-                    !lineClean.includes('financial year') &&
-                    !lineClean.includes('Advisory') &&
-                    !lineClean.includes('Department Name') &&
-                    !lineClean.includes('Organisation Name') &&
-                    !lineClean.includes('Office Name') &&
-                    !lineClean.includes('Buyer Email')) {
-                    
-                    // Clean up the line
-                    let cleanLine = lineClean;
-                    cleanLine = cleanLine.replace(/^\d+\.\s*/, ''); // Remove numbering
-                    cleanLine = cleanLine.replace(/^[^\w\s]*\s*/, ''); // Remove special chars at start
-                    cleanLine = cleanLine.replace(/\s+/g, ' ').trim(); // Normalize spaces
-                    
-                    if (cleanLine.length > 10 && cleanLine.length < 300) {
-                        // Check if this looks like an actual item (not policy text)
-                        const hasItemIndicators = 
-                            cleanLine.includes('PART NO.') ||
-                            cleanLine.includes('CIRCUIT BREAKER') ||
-                            cleanLine.includes('Schneider Electric') ||
-                            cleanLine.includes('Compact') ||
-                            cleanLine.includes('Switch') ||
-                            cleanLine.includes('Socket') ||
-                            cleanLine.includes('Plug') ||
-                            cleanLine.includes('Holder') ||
-                            cleanLine.includes('Cable') ||
-                            cleanLine.includes('Lamp') ||
-                            cleanLine.includes('Light') ||
-                            cleanLine.includes('Contactor') ||
-                            cleanLine.includes('Relay') ||
-                            cleanLine.includes('Timer') ||
-                            cleanLine.includes('Diode') ||
-                            cleanLine.includes('Insulation') ||
-                            cleanLine.includes('Capacitor') ||
-                            cleanLine.includes('Volt') ||
-                            cleanLine.includes('Amp') ||
-                            cleanLine.includes('Watt') ||
-                            cleanLine.includes('sq.mm') ||
-                            cleanLine.includes('mFD') ||
-                            cleanLine.includes('Hz') ||
-                            cleanLine.includes('Phase') ||
-                            cleanLine.includes('Pole') ||
-                            cleanLine.includes('Range') ||
-                            cleanLine.includes('Make') ||
-                            cleanLine.includes('Brand') ||
-                            cleanLine.includes('Model') ||
-                            cleanLine.includes('Type') ||
-                            cleanLine.includes('pieces') ||
-                            cleanLine.includes('units') ||
-                            cleanLine.includes('nos') ||
-                            cleanLine.includes('quantity') ||
-                            cleanLine.includes('qty');
-                        
-                        if (hasItemIndicators) {
-                            items.push(cleanLine);
-                            foundItems = true;
-                            console.log('Found item:', cleanLine);
-                        }
-                    }
-                }
+            if (labelIsStart(lines[i])) {
+                labelLineIdx = i;
+                break;
             }
         }
-        
-        // If we didn't find items in the main section, look for specific patterns
-        if (!foundItems) {
-            console.log('No categorized items found, looking for specific patterns...');
-            
-            // Look for Schneider Electric patterns
-            const schneiderPatterns = [
-                /Schneider\s+Electric\s+[A-Za-z\s]+\(\s*\d+\s*pieces?\s*\)/gi,
-                /Schneider\s+Electric\s+[A-Za-z\s]+/gi,
-                /Compact\s*\(\s*\d+\s*pieces?\s*\)/gi
-            ];
-            
-            for (const pattern of schneiderPatterns) {
-                const matches = text.match(pattern);
-                if (matches) {
-                    items.push(...matches);
-                    foundItems = true;
-                    console.log('Found Schneider Electric pattern:', matches);
-                }
-            }
-            
-            // Look for circuit breaker patterns
-            const circuitBreakerPatterns = [
-                /CIRCUIT\s+BREAKER\s+[A-Z\s]+PART\s+NO\.\s+[A-Z0-9]+/gi,
-                /Circuit\s+Breaker\s+[A-Za-z\s]+Part\s+No\.\s+[A-Z0-9]+/gi,
-                /[A-Z]+\s+PART\s+NO\.\s+[A-Z0-9]+/gi
-            ];
-            
-            for (const pattern of circuitBreakerPatterns) {
-                const matches = text.match(pattern);
-                if (matches) {
-                    items.push(...matches);
-                    foundItems = true;
-                    console.log('Found circuit breaker pattern:', matches);
-                }
-            }
-            
-            // Look for other electrical component patterns
-            const electricalPatterns = [
-                /Switch.*?Socket.*?\d+V.*?\d+A/gi,
-                /Plug.*?Top.*?\d+A/gi,
-                /Holder.*?BC.*?Brass/gi,
-                /Insulation.*?Tape.*?\d+.*?Mtr/gi,
-                /Capacitor.*?\d+.*?mFD.*?\d+V/gi,
-                /Tube.*?Light.*?Holder/gi,
-                /Lamp.*?\d+V.*?\d+W/gi,
-                /Cable.*?\d+.*?sq\.mm.*?Copper/gi,
-                /Contactor.*?\d+V.*?Coil/gi,
-                /Relay.*?range.*?\d+.*?\d+A/gi,
-                /Timer.*?Range.*?\d+.*?\d+S/gi,
-                /Diode.*?battery.*?Charge/gi,
-                /Cable.*?Lugs.*?SIZE.*?\d+.*?Sq\.mm/gi
-            ];
-            
-            for (const pattern of electricalPatterns) {
-                const matches = text.match(pattern);
-                if (matches) {
-                    items.push(...matches);
-                    foundItems = true;
-                }
-            }
+
+        if (labelLineIdx === -1) {
+            console.log('No Item Category label found');
+            return 'Not Found';
         }
-        
-        // Format the found items
-        if (items.length > 0) {
-            // Clean and deduplicate items
-            const cleanItems = [...new Set(items)]
-                .filter(item => item.length > 10 && item.length < 300)
-                .slice(0, 20); // Limit to first 20 items
-            
-            console.log('Found items:', cleanItems.length);
-            return cleanItems.join(' | ');
+
+        // Value may continue on the same line as the label (after the label text) and/or
+        // on the following lines, up to (but not including) the next field's label line
+        const labelLine = lines[labelLineIdx];
+        const valueParts = [];
+
+        // Text after "Item Category" on the same line, if any
+        const sameLineIdx = labelLine.indexOf('Item Category');
+        if (sameLineIdx !== -1) {
+            const remainder = labelLine.substring(sameLineIdx + 'Item Category'.length).trim();
+            if (remainder) valueParts.push(remainder);
         }
-        
-        console.log('No items found');
-        return 'No items found - may be policy document or scanned image';
+
+        // Collect subsequent lines until we hit the next known field, capped at a few
+        // lines so a mis-detected boundary can't swallow the rest of the document
+        const MAX_VALUE_LINES = 6;
+        for (let i = labelLineIdx + 1; i < lines.length && valueParts.length < MAX_VALUE_LINES; i++) {
+            if (labelIsStop(lines[i])) break;
+            valueParts.push(lines[i]);
+        }
+
+        let value = valueParts.join(' ').replace(/\s+/g, ' ').trim();
+        value = value.replace(/^[\/:\-\s]+/, '').trim(); // strip leading separators
+
+        if (value.length >= 2) {
+            console.log('Extracted Item Category:', value);
+            return value;
+        }
+
+        console.log('Item Category label found but no value captured');
+        return 'Not Found';
     }
 
-    // Extract technical specification URL from PDF text
+
+    // REWRITTEN: extractTechnicalSpec - Now captures the actual inline "Technical
+    // Specifications" text from the bid document (works even when there is no
+    // hyperlink at all), and falls back to / appends the linked spec document URL
+    // (BOQ / Buyer Spec / GeM Category Specification) when one is present.
     extractTechnicalSpec(text) {
         console.log('\n=== EXTRACTING TECHNICAL SPECIFICATION ===');
-        
-        // If we have no extracted links, return early
+
+        const specText = this.extractTechnicalSpecText(text);
+        const specUrl = this.extractTechnicalSpecUrl();
+
+        if (specText && specUrl) {
+            console.log('✅ Found both inline spec text and a spec document URL');
+            return `${specText}\nDocument: ${specUrl}`;
+        }
+        if (specText) {
+            console.log('✅ Found inline technical specification text');
+            return specText;
+        }
+        if (specUrl) {
+            console.log('✅ Found technical specification document URL (no inline text)');
+            return specUrl;
+        }
+
+        console.log('❌ No technical specification found (text or URL)');
+        return 'Not Found';
+    }
+
+    // NEW: extractTechnicalSpecText - Generically extract the text of the "Technical
+    // Specifications" section of the bid, regardless of product category. Returns null
+    // when the section only contains a placeholder reference (e.g. "As per GeM Category
+    // Specification") pointing to an external document, so the caller can fall back to
+    // the URL instead of returning a near-empty string.
+    extractTechnicalSpecText(text) {
+        const startPatterns = [
+            'Technical Specifications/तकनीकी विशिष्टियाँ',
+            'Technical Specifications/',
+            'Technical Specifications',
+            'तकनीकी विशिष्टियाँ'
+        ];
+
+        const stopPatterns = [
+            'Consignees/Reporting Officer', 'Consignees', 'Buyer Added Bid',
+            'Input Tax Credit', 'EMD Detail', 'Evaluation Method', 'Inspection Required',
+            'Advisory', 'Experience Criteria', 'Preference to Make In India',
+            'Purchase preference for MSEs', 'Estimated Bid Value', 'Past Performance',
+            'Splitting', 'ePBG Detail', 'Additional Bid Documents',
+            'Buyer uploaded specification'
+        ];
+
+        let startIdx = -1;
+        let matchedStartLen = 0;
+        for (const pattern of startPatterns) {
+            const idx = text.indexOf(pattern);
+            if (idx !== -1 && (startIdx === -1 || idx < startIdx)) {
+                startIdx = idx;
+                matchedStartLen = pattern.length;
+            }
+        }
+
+        if (startIdx === -1) {
+            console.log('No Technical Specifications header found in text');
+            return null;
+        }
+
+        const afterStart = text.substring(startIdx + matchedStartLen);
+
+        let stopIdx = afterStart.length;
+        for (const pattern of stopPatterns) {
+            const idx = afterStart.indexOf(pattern);
+            if (idx !== -1 && idx < stopIdx) {
+                stopIdx = idx;
+            }
+        }
+
+        // Cap the section length as a safety net in case no stop pattern is found
+        const sectionText = afterStart.substring(0, Math.min(stopIdx, 3000));
+
+        // Patterns that indicate the section is just a placeholder pointing to a linked
+        // document rather than containing real spec text
+        const placeholderPatterns = [
+            'as per gem category specification',
+            'जेम केटेगरी विशिष्टि के अनुसार',
+            'जेम केटेगरी विशिष्टि'
+        ];
+
+        const rawLines = sectionText.split(/\n|\s{3,}/);
+        const cleanLines = [];
+
+        for (let line of rawLines) {
+            let lineClean = line.trim();
+            if (!lineClean || lineClean.length < 3) continue;
+            if (/^\d+\s*\/\s*\d+$/.test(lineClean)) continue; // page numbers
+            if (lineClean.startsWith('*')) lineClean = lineClean.replace(/^\*+\s*/, '');
+            if (!lineClean) continue;
+
+            lineClean = lineClean.replace(/\s+/g, ' ').trim();
+            // Drop a trailing fragment left over when the section text was cut mid-line
+            // right before a stop pattern (e.g. "...तथा मात्रा/" with "Consignees..." removed)
+            if (lineClean.endsWith('/') || lineClean.endsWith('-')) continue;
+
+            if (lineClean.length >= 3 && lineClean.length < 500) {
+                cleanLines.push(lineClean);
+            }
+        }
+
+        const uniqueLines = [...new Set(cleanLines)];
+
+        if (uniqueLines.length === 0) {
+            return null;
+        }
+
+        const combined = uniqueLines.join(' | ');
+        const lowerCombined = combined.toLowerCase();
+
+        // If every meaningful line is just the "as per GeM Category Specification"
+        // placeholder, treat as no inline text so we fall back to the linked document URL
+        const isPlaceholderOnly = placeholderPatterns.some(p => lowerCombined.includes(p)) &&
+            combined.length < 80;
+
+        if (isPlaceholderOnly) {
+            console.log('Technical Specifications section is only a placeholder reference:', combined);
+            return null;
+        }
+
+        console.log('Extracted Technical Specification text:', combined);
+        return uniqueLines.slice(0, 30).join(' | ');
+    }
+
+    // Renamed from the old extractTechnicalSpec: selects the best matching linked
+    // specification document URL (BOQ / Buyer Spec / GeM Category Specification)
+    extractTechnicalSpecUrl() {
         if (!this.pdfLinks || this.pdfLinks.length === 0) {
             console.log('❌ No links found in PDF');
-            return 'No technical specification URLs found';
+            return null;
         }
-        
-        // Show all found links and their types
+
         console.log(`📋 Found ${this.pdfLinks.length} links:`);
         this.pdfLinks.forEach((link, index) => {
             console.log(`  ${index + 1}. ${link.type}: ${link.url}`);
         });
-        
-        // Priority order for link types
+
         const linkPriority = [
             'BOQ Detail Document',
             'Buyer Specification Document',
             'GeM Category Specification'
         ];
-        
-        // Look for links in priority order
+
         for (const priority of linkPriority) {
             const link = this.pdfLinks.find(l => l.type === priority);
             if (link) {
@@ -1455,9 +1505,9 @@ class GeMBiddingDataExtractor {
                 return link.url;
             }
         }
-        
+
         console.log('❌ No technical specification URLs found');
-        return 'No technical specification URLs found';
+        return null;
     }
 
 
