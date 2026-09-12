@@ -1023,6 +1023,8 @@ class GeMBiddingDataExtractor {
             'Organization Name': this.extractOrganizationName(text),
             'Total Quantity': this.extractTotalQuantity(text),
             'Item Category': this.extractItemCategory(text),
+            'Primary Product Category': this.extractPrimaryProductCategory(text),
+            'Relevant Categories': this.extractRelevantCategories(text),
             'Technical Specification': this.extractTechnicalSpec(text),
             'Filename': filename // NEW: Add filename as last column
         };
@@ -1350,6 +1352,141 @@ class GeMBiddingDataExtractor {
         return 'Not Found';
     }
 
+    // NEW: extractPrimaryProductCategory - captures the "प्राथमिक उत्पाद श्रेणी / Primary
+    // product category" field. Same shape as Item Category: a single value sitting on its
+    // own line right below (or after) the bilingual label.
+    extractPrimaryProductCategory(text) {
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+        const markers = ['Primary product category', 'प्राथमिक उत्पाद श्रेणी'];
+        const labelIsStart = (line) => markers.some(m => line.includes(m));
+
+        const labelIsStop = (line) =>
+            line.includes('Item Category') ||
+            line.includes('मद केटेगरी') ||
+            line.includes('Relevant Categories') ||
+            line.includes('प्रासंगिक श्रेणियाँ') ||
+            line.includes('Technical Specifications') ||
+            line.includes('MSE Relaxation') ||
+            line.includes('एमएसएमई') ||
+            line.includes('Startup Relaxation') ||
+            line.includes('स्टाट%अप') ||
+            line.includes('टाट%अप');
+
+        let labelLineIdx = -1;
+        for (let i = 0; i < lines.length; i++) {
+            if (labelIsStart(lines[i])) {
+                labelLineIdx = i;
+                break;
+            }
+        }
+
+        if (labelLineIdx === -1) {
+            console.log('No Primary product category label found');
+            return 'Not Found';
+        }
+
+        const labelLine = lines[labelLineIdx];
+        const valueParts = [];
+
+        let sameLineIdx = -1, markerLength = 0;
+        for (const marker of markers) {
+            const idx = labelLine.indexOf(marker);
+            if (idx !== -1) { sameLineIdx = idx; markerLength = marker.length; break; }
+        }
+        if (sameLineIdx !== -1) {
+            const remainder = labelLine.substring(sameLineIdx + markerLength).trim();
+            if (remainder) valueParts.push(remainder);
+        }
+
+        const MAX_VALUE_LINES = 4;
+        for (let i = labelLineIdx + 1; i < lines.length && valueParts.length < MAX_VALUE_LINES; i++) {
+            if (labelIsStop(lines[i])) break;
+            valueParts.push(lines[i]);
+        }
+
+        let value = valueParts.join(' ').replace(/\s+/g, ' ').trim();
+        value = value.replace(/^[\/:\-\s]+/, '').trim();
+
+        if (value.length >= 2) {
+            console.log('Extracted Primary product category:', value);
+            return value;
+        }
+
+        console.log('Primary product category label found but no value captured');
+        return 'Not Found';
+    }
+
+    // NEW: extractRelevantCategories - captures "अधिसूचना के लिए चयनित प्रासंगिक श्रेणियाँ /
+    // Relevant Categories selected for notification". This can list more than one category,
+    // so we allow more lines and keep them newline-separated (mirrors how Item Category is
+    // stored when it holds multiple groups).
+    extractRelevantCategories(text) {
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+        const markers = [
+            'Relevant Categories selected for notification',
+            'Relevant Categories',
+            'प्रासंगिक श्रेणियाँ',
+            'अधिसूचना के लिए'
+        ];
+        const labelIsStart = (line) => markers.some(m => line.includes(m));
+
+        const labelIsStop = (line) =>
+            line.includes('Item Category') ||
+            line.includes('मद केटेगरी') ||
+            line.includes('Primary product category') ||
+            line.includes('प्राथमिक उत्पाद श्रेणी') ||
+            line.includes('Technical Specifications') ||
+            line.includes('MSE Relaxation') ||
+            line.includes('एमएसएमई') ||
+            line.includes('Startup Relaxation') ||
+            line.includes('स्टाट%अप') ||
+            line.includes('टाट%अप');
+
+        let labelLineIdx = -1;
+        for (let i = 0; i < lines.length; i++) {
+            if (labelIsStart(lines[i])) {
+                labelLineIdx = i;
+                break;
+            }
+        }
+
+        if (labelLineIdx === -1) {
+            console.log('No Relevant Categories label found');
+            return 'Not Found';
+        }
+
+        const labelLine = lines[labelLineIdx];
+        const valueParts = [];
+
+        let sameLineIdx = -1, markerLength = 0;
+        for (const marker of markers) {
+            const idx = labelLine.indexOf(marker);
+            if (idx !== -1) { sameLineIdx = idx; markerLength = marker.length; break; }
+        }
+        if (sameLineIdx !== -1) {
+            const remainder = labelLine.substring(sameLineIdx + markerLength).trim();
+            if (remainder) valueParts.push(remainder);
+        }
+
+        const MAX_VALUE_LINES = 10;
+        for (let i = labelLineIdx + 1; i < lines.length && valueParts.length < MAX_VALUE_LINES; i++) {
+            if (labelIsStop(lines[i])) break;
+            valueParts.push(lines[i]);
+        }
+
+        let value = valueParts.join('\n').replace(/^[\/:\-\s]+/, '').trim();
+
+        if (value.length >= 2) {
+            console.log('Extracted Relevant Categories:', value);
+            return value;
+        }
+
+        console.log('Relevant Categories label found but no value captured');
+        return 'Not Found';
+    }
+
 
     // REWRITTEN: extractTechnicalSpec - Now captures the actual inline "Technical
     // Specifications" text from the bid document (works even when there is no
@@ -1582,7 +1719,7 @@ class GeMBiddingDataExtractor {
             // Create main data array with headers
             const headers = [
                 'BID Number', 'Ministry', 'Department', 'BID Start Date', 'BID End Date', 'Organization Name', 'Total Quantity', 
-                'Item Category', 'Technical Specification', 'Filename'
+                'Item Category', 'Primary Product Category', 'Relevant Categories', 'Technical Specification', 'Filename'
             ];
             
             const data = [headers];
@@ -1604,6 +1741,8 @@ class GeMBiddingDataExtractor {
                     row['Organization Name'] || '-',
                     row['Total Quantity'] || 'Not Found',
                     row['Item Category'] || 'Not Found',
+                    row['Primary Product Category'] || 'Not Found',
+                    row['Relevant Categories'] || 'Not Found',
                     techSpecCell, // Use the cell object with formula
                     row['Filename'] || 'Not Found'
                 ]);
@@ -1638,6 +1777,8 @@ class GeMBiddingDataExtractor {
                     row['Organization Name'] || '-',
                     row['Total Quantity'] || 'Not Found',
                     row['Item Category'] || 'Not Found',
+                    row['Primary Product Category'] || 'Not Found',
+                    row['Relevant Categories'] || 'Not Found',
                         techSpecCell,
                         row['Filename'] || 'Not Found'
                     ]);
@@ -1665,6 +1806,8 @@ class GeMBiddingDataExtractor {
                     row['Organization Name'] || '-',
                     row['Total Quantity'] || 'Not Found',
                     row['Item Category'] || 'Not Found',
+                    row['Primary Product Category'] || 'Not Found',
+                    row['Relevant Categories'] || 'Not Found',
                         techSpecCell,
                         row['Filename'] || 'Not Found'
                     ]);
@@ -1851,6 +1994,16 @@ class GeMBiddingDataExtractor {
                 const itemCount = data['Item Category'].split('\n').length;
                 summaryHTML += `<div class="summary-item"><span class="summary-label">Categories Found:</span><span class="summary-value">${itemCount} groups</span></div>`;
             }
+
+            // Show Primary Product Category / Relevant Categories if found
+            if (data['Primary Product Category'] && data['Primary Product Category'] !== 'Not Found') {
+                const value = data['Primary Product Category'].length > 30 ? data['Primary Product Category'].substring(0, 30) + '...' : data['Primary Product Category'];
+                summaryHTML += `<div class="summary-item"><span class="summary-label">Primary Product Category:</span><span class="summary-value">${value}</span></div>`;
+            }
+            if (data['Relevant Categories'] && data['Relevant Categories'] !== 'Not Found') {
+                const relCount = data['Relevant Categories'].split('\n').length;
+                summaryHTML += `<div class="summary-item"><span class="summary-label">Relevant Categories:</span><span class="summary-value">${relCount} found</span></div>`;
+            }
             
             if (index < this.extractedData.length - 1) {
                 summaryHTML += '<hr style="margin: 15px 0; border: none; border-top: 1px solid #e9ecef;">';
@@ -1905,6 +2058,12 @@ class GeMBiddingDataExtractor {
         if (data['Item Category'] === 'Not Found') {
             warnings.push('Item Category not found in document');
             isValid = false;
+        }
+        if (data['Primary Product Category'] === 'Not Found') {
+            warnings.push('Primary Product Category not found in document');
+        }
+        if (data['Relevant Categories'] === 'Not Found') {
+            warnings.push('Relevant Categories not found in document');
         }
 
         // Check for reasonable data lengths
