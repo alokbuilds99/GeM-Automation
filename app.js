@@ -1421,7 +1421,11 @@ class GeMBiddingDataExtractor {
         let prev;
         do {
             prev = result;
-            result = result.replace(/^[\/\-:,*|]+\s*/, '').replace(/\s*[\/\-:,*|]+$/, '').trim();
+            // Only apply the trim if it leaves real content behind - a value made
+            // ENTIRELY of separator chars (e.g. "-" used as a placeholder for
+            // "not found") is meaningful content, not an artifact, and must survive.
+            const trimmed = result.replace(/^[\/\-:,*|]+\s*/, '').replace(/\s*[\/\-:,*|]+$/, '').trim();
+            if (trimmed.length > 0) result = trimmed;
         } while (result !== prev);
         return result;
     }
@@ -1446,7 +1450,8 @@ class GeMBiddingDataExtractor {
         let prev;
         do {
             prev = result;
-            result = result.replace(/^[\/\-:,*|]+\s*/, '').replace(/\s*[\/\-:,*|]+$/, '').trim();
+            const trimmed = result.replace(/^[\/\-:,*|]+\s*/, '').replace(/\s*[\/\-:,*|]+$/, '').trim();
+            if (trimmed.length > 0) result = trimmed;
         } while (result !== prev);
         return result;
     }
@@ -1465,22 +1470,30 @@ class GeMBiddingDataExtractor {
     // product category" field. Same shape as Item Category: a single value sitting on its
     // own line right below (or after) the bilingual label.
     extractPrimaryProductCategory(text) {
-        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        // Normalize invisible/odd whitespace (nbsp, zero-width space, BOM) that PDF.js
+        // sometimes emits, which would otherwise make an exact .includes() match fail.
+        const lines = text.split('\n')
+            .map(l => l.replace(/[\u00A0\u200B\uFEFF]/g, ' ').replace(/\s+/g, ' ').trim())
+            .filter(l => l.length > 0);
 
-        const markers = ['Primary product category', 'प्राथमिक उत्पाद श्रेणी'];
-        const labelIsStart = (line) => markers.some(m => line.includes(m));
+        // Compare case-insensitively for the English marker (source PDFs are inconsistent
+        // about capitalization); Devanagari has no case so this is a no-op for it.
+        const markers = ['primary product category', 'प्राथमिक उत्पाद श्रेणी'];
+        const labelIsStart = (line) => markers.some(m => line.toLowerCase().includes(m));
 
-        const labelIsStop = (line) =>
-            line.includes('Item Category') ||
-            line.includes('मद केटेगरी') ||
-            line.includes('Relevant Categories') ||
-            line.includes('प्रासंगिक श्रेणियाँ') ||
-            line.includes('Technical Specifications') ||
-            line.includes('MSE Relaxation') ||
-            line.includes('एमएसएमई') ||
-            line.includes('Startup Relaxation') ||
-            line.includes('स्टाट%अप') ||
-            line.includes('टाट%अप');
+        const labelIsStop = (line) => {
+            const l = line.toLowerCase();
+            return l.includes('item category') ||
+                line.includes('मद केटेगरी') ||
+                l.includes('relevant categories') ||
+                line.includes('प्रासंगिक श्रेणियाँ') ||
+                l.includes('technical specifications') ||
+                l.includes('mse relaxation') ||
+                line.includes('एमएसएमई') ||
+                l.includes('startup relaxation') ||
+                line.includes('स्टाट%अप') ||
+                line.includes('टाट%अप');
+        };
 
         let labelLineIdx = -1;
         for (let i = 0; i < lines.length; i++) {
@@ -1496,11 +1509,12 @@ class GeMBiddingDataExtractor {
         }
 
         const labelLine = lines[labelLineIdx];
+        const labelLineLower = labelLine.toLowerCase();
         const valueParts = [];
 
         let sameLineIdx = -1, markerLength = 0;
         for (const marker of markers) {
-            const idx = labelLine.indexOf(marker);
+            const idx = labelLineLower.indexOf(marker);
             if (idx !== -1) { sameLineIdx = idx; markerLength = marker.length; break; }
         }
         if (sameLineIdx !== -1) {
@@ -1532,27 +1546,35 @@ class GeMBiddingDataExtractor {
     // so we allow more lines and keep them newline-separated (mirrors how Item Category is
     // stored when it holds multiple groups).
     extractRelevantCategories(text) {
-        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        // Normalize invisible/odd whitespace (nbsp, zero-width space, BOM) that PDF.js
+        // sometimes emits, which would otherwise make an exact .includes() match fail.
+        const lines = text.split('\n')
+            .map(l => l.replace(/[\u00A0\u200B\uFEFF]/g, ' ').replace(/\s+/g, ' ').trim())
+            .filter(l => l.length > 0);
 
+        // Compare case-insensitively for the English markers (source PDFs are
+        // inconsistent about capitalization); Devanagari has no case so this is a no-op.
         const markers = [
-            'Relevant Categories selected for notification',
-            'Relevant Categories',
+            'relevant categories selected for notification',
+            'relevant categories',
             'प्रासंगिक श्रेणियाँ',
             'अधिसूचना के लिए'
         ];
-        const labelIsStart = (line) => markers.some(m => line.includes(m));
+        const labelIsStart = (line) => markers.some(m => line.toLowerCase().includes(m));
 
-        const labelIsStop = (line) =>
-            line.includes('Item Category') ||
-            line.includes('मद केटेगरी') ||
-            line.includes('Primary product category') ||
-            line.includes('प्राथमिक उत्पाद श्रेणी') ||
-            line.includes('Technical Specifications') ||
-            line.includes('MSE Relaxation') ||
-            line.includes('एमएसएमई') ||
-            line.includes('Startup Relaxation') ||
-            line.includes('स्टाट%अप') ||
-            line.includes('टाट%अप');
+        const labelIsStop = (line) => {
+            const l = line.toLowerCase();
+            return l.includes('item category') ||
+                line.includes('मद केटेगरी') ||
+                l.includes('primary product category') ||
+                line.includes('प्राथमिक उत्पाद श्रेणी') ||
+                l.includes('technical specifications') ||
+                l.includes('mse relaxation') ||
+                line.includes('एमएसएमई') ||
+                l.includes('startup relaxation') ||
+                line.includes('स्टाट%अप') ||
+                line.includes('टाट%अप');
+        };
 
         let labelLineIdx = -1;
         for (let i = 0; i < lines.length; i++) {
@@ -1568,11 +1590,12 @@ class GeMBiddingDataExtractor {
         }
 
         const labelLine = lines[labelLineIdx];
+        const labelLineLower = labelLine.toLowerCase();
         const valueParts = [];
 
         let sameLineIdx = -1, markerLength = 0;
         for (const marker of markers) {
-            const idx = labelLine.indexOf(marker);
+            const idx = labelLineLower.indexOf(marker);
             if (idx !== -1) { sameLineIdx = idx; markerLength = marker.length; break; }
         }
         if (sameLineIdx !== -1) {
