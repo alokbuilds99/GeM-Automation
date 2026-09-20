@@ -1352,6 +1352,19 @@ class GeMBiddingDataExtractor {
         return 'Not Found';
     }
 
+    // NEW: stripDevanagari - removes Devanagari script (Hindi) characters from a value so
+    // only the English/Latin portion of a bilingual field is kept. Also cleans up the
+    // leftover slashes/spaces/punctuation that separated the Hindi and English text.
+    stripDevanagari(value) {
+        if (!value) return value;
+        return value
+            .replace(/[\u0900-\u097F]+/g, ' ')  // strip Devanagari block
+            .replace(/[\/\-:,]{1,}\s*(?=[\/\-:,]|$)/g, ' ') // collapse dangling separators
+            .replace(/\s+/g, ' ')
+            .replace(/^[\/:\-,\s]+|[\/:\-,\s]+$/g, '') // trim leading/trailing separators
+            .trim();
+    }
+
     // NEW: extractPrimaryProductCategory - captures the "प्राथमिक उत्पाद श्रेणी / Primary
     // product category" field. Same shape as Item Category: a single value sitting on its
     // own line right below (or after) the bilingual label.
@@ -1407,6 +1420,7 @@ class GeMBiddingDataExtractor {
 
         let value = valueParts.join(' ').replace(/\s+/g, ' ').trim();
         value = value.replace(/^[\/:\-\s]+/, '').trim();
+        value = this.stripDevanagari(value); // Keep English/Latin text only, drop Hindi
 
         if (value.length >= 2) {
             console.log('Extracted Primary product category:', value);
@@ -1476,7 +1490,13 @@ class GeMBiddingDataExtractor {
             valueParts.push(lines[i]);
         }
 
-        let value = valueParts.join('\n').replace(/^[\/:\-\s]+/, '').trim();
+        // Strip Devanagari per line first, then drop any line that was Hindi-only
+        // (and so became empty), so the joined result is English/Latin text only.
+        let value = valueParts
+            .map(line => this.stripDevanagari(line))
+            .filter(line => line.length > 0)
+            .join('\n')
+            .trim();
 
         if (value.length >= 2) {
             console.log('Extracted Relevant Categories:', value);
