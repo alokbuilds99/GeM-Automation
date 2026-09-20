@@ -1029,6 +1029,27 @@ class GeMBiddingDataExtractor {
             'Filename': filename // NEW: Add filename as last column
         };
 
+        // NEW: Strip Devanagari (Hindi) script from every field so only English/Latin
+        // text is kept in the output. Filename is skipped (it's never bilingual and we
+        // don't want to touch the actual uploaded file name), and multi-line values
+        // (e.g. Item Category, Relevant Categories) are cleaned line-by-line so a
+        // Hindi-only line is dropped instead of left as a blank line.
+        Object.keys(data).forEach(key => {
+            if (key === 'Filename') return;
+            const value = data[key];
+            if (typeof value !== 'string') return;
+            if (value.includes('\n')) {
+                data[key] = value
+                    .split('\n')
+                    .map(line => this.stripDevanagari(line))
+                    .filter(line => line.length > 0)
+                    .join('\n');
+            } else {
+                data[key] = this.stripDevanagari(value);
+            }
+            if (!data[key]) data[key] = 'Not Found';
+        });
+
         console.log('Extracted data:', data);
         return data;
     }
@@ -1353,16 +1374,20 @@ class GeMBiddingDataExtractor {
     }
 
     // NEW: stripDevanagari - removes Devanagari script (Hindi) characters from a value so
-    // only the English/Latin portion of a bilingual field is kept. Also cleans up the
-    // leftover slashes/spaces/punctuation that separated the Hindi and English text.
+    // only the English/Latin portion of a bilingual field is kept. Devanagari is removed
+    // wherever it appears in the string; stray separators (/ - : ,) left over from the
+    // "Hindi / English" label formatting are only trimmed from the START/END of the
+    // string, never collapsed mid-string, so this is safe to run on URLs, IDs and dates
+    // (e.g. "https://..." or "GEM/2025/B/123" pass through untouched).
     stripDevanagari(value) {
         if (!value) return value;
-        return value
-            .replace(/[\u0900-\u097F]+/g, ' ')  // strip Devanagari block
-            .replace(/[\/\-:,]{1,}\s*(?=[\/\-:,]|$)/g, ' ') // collapse dangling separators
-            .replace(/\s+/g, ' ')
-            .replace(/^[\/:\-,\s]+|[\/:\-,\s]+$/g, '') // trim leading/trailing separators
-            .trim();
+        let result = value.replace(/[\u0900-\u097F]+/g, ' ').replace(/\s+/g, ' ').trim();
+        let prev;
+        do {
+            prev = result;
+            result = result.replace(/^[\/\-:,]+\s*/, '').replace(/\s*[\/\-:,]+$/, '').trim();
+        } while (result !== prev);
+        return result;
     }
 
     // NEW: extractPrimaryProductCategory - captures the "प्राथमिक उत्पाद श्रेणी / Primary
@@ -1420,7 +1445,7 @@ class GeMBiddingDataExtractor {
 
         let value = valueParts.join(' ').replace(/\s+/g, ' ').trim();
         value = value.replace(/^[\/:\-\s]+/, '').trim();
-        value = this.stripDevanagari(value); // Keep English/Latin text only, drop Hindi
+        // Note: Devanagari stripping now happens centrally in extractDataFromText
 
         if (value.length >= 2) {
             console.log('Extracted Primary product category:', value);
@@ -1490,13 +1515,9 @@ class GeMBiddingDataExtractor {
             valueParts.push(lines[i]);
         }
 
-        // Strip Devanagari per line first, then drop any line that was Hindi-only
-        // (and so became empty), so the joined result is English/Latin text only.
-        let value = valueParts
-            .map(line => this.stripDevanagari(line))
-            .filter(line => line.length > 0)
-            .join('\n')
-            .trim();
+        // Note: Devanagari stripping (and dropping any resulting empty lines) now
+        // happens centrally in extractDataFromText.
+        let value = valueParts.join('\n').trim();
 
         if (value.length >= 2) {
             console.log('Extracted Relevant Categories:', value);
