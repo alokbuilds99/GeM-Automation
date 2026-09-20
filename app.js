@@ -1029,15 +1029,29 @@ class GeMBiddingDataExtractor {
             'Filename': filename // NEW: Add filename as last column
         };
 
-        // NEW: Strip Devanagari (Hindi) script from every field so only English/Latin
-        // text is kept in the output. Filename is skipped (it's never bilingual and we
-        // don't want to touch the actual uploaded file name), and multi-line values
-        // (e.g. Item Category, Relevant Categories) are cleaned line-by-line so a
-        // Hindi-only line is dropped instead of left as a blank line.
+        // NEW: Strip Devanagari (Hindi) script from every field, including the filename,
+        // so NO Devanagari ever reaches the Excel file - only English/Latin text remains.
+        // Multi-line values (e.g. Item Category, Relevant Categories) are cleaned
+        // line-by-line so a Hindi-only line is dropped instead of left as a blank line.
         Object.keys(data).forEach(key => {
-            if (key === 'Filename') return;
             const value = data[key];
             if (typeof value !== 'string') return;
+
+            if (key === 'Filename') {
+                // Preserve the file extension; only clean the base name so a
+                // Devanagari-named upload doesn't lose its .pdf entirely.
+                const dotIdx = value.lastIndexOf('.');
+                const base = dotIdx > 0 ? value.substring(0, dotIdx) : value;
+                const ext = dotIdx > 0 ? value.substring(dotIdx) : '';
+                let cleanBase = this.stripDevanagari(base);
+                // Filenames typically use underscores as separators; collapse any
+                // underscore/space runs left behind by Devanagari removal (e.g.
+                // "बिड_फाइल_2025" -> "_ _2025" -> "2025") and trim stray edge underscores.
+                cleanBase = cleanBase.replace(/[\s_]+/g, '_').replace(/^_+|_+$/g, '');
+                data[key] = (cleanBase || 'Document') + ext;
+                return;
+            }
+
             if (value.includes('\n')) {
                 data[key] = value
                     .split('\n')
@@ -1374,18 +1388,27 @@ class GeMBiddingDataExtractor {
     }
 
     // NEW: stripDevanagari - removes Devanagari script (Hindi) characters from a value so
-    // only the English/Latin portion of a bilingual field is kept. Devanagari is removed
-    // wherever it appears in the string; stray separators (/ - : ,) left over from the
-    // "Hindi / English" label formatting are only trimmed from the START/END of the
-    // string, never collapsed mid-string, so this is safe to run on URLs, IDs and dates
-    // (e.g. "https://..." or "GEM/2025/B/123" pass through untouched).
+    // NO Devanagari ever reaches the Excel file, keeping only the English/Latin portion.
+    // Devanagari is removed wherever it appears in the string (start, middle, or end).
+    // Leftover artifacts from bilingual "Hindi / English" formatting are then cleaned up:
+    //   - now-empty bracket/quote pairs, e.g. "Category ()" -> "Category", "text \"\"" -> "text"
+    //   - stray separators (/ - : , * |) trimmed from the START/END only (looped until
+    //     stable), never collapsed mid-string, so this is safe to run on URLs, IDs and
+    //     dates (e.g. "https://..." or "GEM/2025/B/123" pass through completely untouched).
     stripDevanagari(value) {
         if (!value) return value;
-        let result = value.replace(/[\u0900-\u097F]+/g, ' ').replace(/\s+/g, ' ').trim();
+        let result = value.replace(/[\u0900-\u097F]+/g, ' ');
+        // Collapse now-empty bracket/quote pairs left behind once Devanagari is removed
+        result = result
+            .replace(/\(\s*\)/g, ' ')
+            .replace(/\[\s*\]/g, ' ')
+            .replace(/\{\s*\}/g, ' ')
+            .replace(/["'“”‘’]\s*["'“”‘’]/g, ' ');
+        result = result.replace(/\s+/g, ' ').trim();
         let prev;
         do {
             prev = result;
-            result = result.replace(/^[\/\-:,]+\s*/, '').replace(/\s*[\/\-:,]+$/, '').trim();
+            result = result.replace(/^[\/\-:,*|]+\s*/, '').replace(/\s*[\/\-:,*|]+$/, '').trim();
         } while (result !== prev);
         return result;
     }
