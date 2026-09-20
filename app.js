@@ -1029,23 +1029,26 @@ class GeMBiddingDataExtractor {
             'Filename': filename // NEW: Add filename as last column
         };
 
-        // NEW: Strip Devanagari (Hindi) script from every field, including the filename,
-        // so NO Devanagari ever reaches the Excel file - only English/Latin text remains.
+        // NEW: Clean every field, including the filename, so English/Latin text is kept
+        // wherever it exists AND "tofu box" junk from unmapped PDF fonts is always
+        // removed. If a field has NO English content at all, we keep its Devanagari text
+        // instead of showing "Not Found" - showing something real beats showing nothing.
         // Multi-line values (e.g. Item Category, Relevant Categories) are cleaned
-        // line-by-line so a Hindi-only line is dropped instead of left as a blank line.
+        // line-by-line, so each line independently keeps its English if it has any, or
+        // its Devanagari if that's all it has; only truly empty/junk-only lines are
+        // dropped.
         Object.keys(data).forEach(key => {
             const value = data[key];
             if (typeof value !== 'string') return;
 
             if (key === 'Filename') {
-                // Preserve the file extension; only clean the base name so a
-                // Devanagari-named upload doesn't lose its .pdf entirely.
+                // Preserve the file extension; only clean the base name.
                 const dotIdx = value.lastIndexOf('.');
                 const base = dotIdx > 0 ? value.substring(0, dotIdx) : value;
                 const ext = dotIdx > 0 ? value.substring(dotIdx) : '';
-                let cleanBase = this.stripDevanagari(base);
+                let cleanBase = this.cleanFieldValue(base);
                 // Filenames typically use underscores as separators; collapse any
-                // underscore/space runs left behind by Devanagari removal (e.g.
+                // underscore/space runs left behind by cleanup (e.g.
                 // "बिड_फाइल_2025" -> "_ _2025" -> "2025") and trim stray edge underscores.
                 cleanBase = cleanBase.replace(/[\s_]+/g, '_').replace(/^_+|_+$/g, '');
                 data[key] = (cleanBase || 'Document') + ext;
@@ -1055,11 +1058,11 @@ class GeMBiddingDataExtractor {
             if (value.includes('\n')) {
                 data[key] = value
                     .split('\n')
-                    .map(line => this.stripDevanagari(line))
+                    .map(line => this.cleanFieldValue(line))
                     .filter(line => line.length > 0)
                     .join('\n');
             } else {
-                data[key] = this.stripDevanagari(value);
+                data[key] = this.cleanFieldValue(value);
             }
             if (!data[key]) data[key] = 'Not Found';
         });
@@ -1421,6 +1424,41 @@ class GeMBiddingDataExtractor {
             result = result.replace(/^[\/\-:,*|]+\s*/, '').replace(/\s*[\/\-:,*|]+$/, '').trim();
         } while (result !== prev);
         return result;
+    }
+
+    // NEW: cleanPreservingDevanagari - fallback cleaner used ONLY when a value has NO
+    // English/Latin content at all (stripDevanagari would leave it empty). In that case,
+    // rather than showing "Not Found", we keep the Devanagari text itself - it's the only
+    // content available for that field. This still strips the "tofu box" (□) junk glyphs
+    // from unmapped PDF fonts (Private Use Area / Specials blocks), since those are never
+    // real text either way, but genuine Devanagari script is preserved.
+    cleanPreservingDevanagari(value) {
+        if (!value) return value;
+        let result = value.replace(
+            /[^\t\n\x20-\x7E\u0900-\u097F\u1CD0-\u1CFF\uA8E0-\uA8FF°₹±×µ–—]+/g, ' '
+        );
+        result = result
+            .replace(/\(\s*\)/g, ' ')
+            .replace(/\[\s*\]/g, ' ')
+            .replace(/\{\s*\}/g, ' ')
+            .replace(/["'“”‘’]\s*["'“”‘’]/g, ' ');
+        result = result.replace(/\s+/g, ' ').trim();
+        let prev;
+        do {
+            prev = result;
+            result = result.replace(/^[\/\-:,*|]+\s*/, '').replace(/\s*[\/\-:,*|]+$/, '').trim();
+        } while (result !== prev);
+        return result;
+    }
+
+    // NEW: cleanFieldValue - runs stripDevanagari (English/Latin only) first; if that
+    // leaves nothing (the source text had no English at all for this value), falls back
+    // to cleanPreservingDevanagari so the Devanagari content is shown instead of losing
+    // the field entirely.
+    cleanFieldValue(raw) {
+        const latinOnly = this.stripDevanagari(raw);
+        if (latinOnly) return latinOnly;
+        return this.cleanPreservingDevanagari(raw);
     }
 
     // NEW: extractPrimaryProductCategory - captures the "प्राथमिक उत्पाद श्रेणी / Primary
