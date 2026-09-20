@@ -1387,9 +1387,18 @@ class GeMBiddingDataExtractor {
         return 'Not Found';
     }
 
-    // NEW: stripDevanagari - removes Devanagari script (Hindi) characters from a value so
-    // NO Devanagari ever reaches the Excel file, keeping only the English/Latin portion.
-    // Devanagari is removed wherever it appears in the string (start, middle, or end).
+    // NEW: stripDevanagari - removes Devanagari script (Hindi) characters AND any other
+    // non-Latin/unprintable glyphs from a value, so NO Devanagari and no "tofu box" (□)
+    // junk ever reaches the Excel file - only the English/Latin portion survives.
+    //
+    // Some GeM PDFs embed custom Indic fonts whose glyphs pdf.js can't map to real
+    // Unicode Devanagari code points; those extract as Private-Use-Area / unmapped
+    // characters that render as empty boxes (□□□M □□M ...) instead of being caught by
+    // the standard Devanagari-block filter. To catch those too, this uses an ALLOWLIST
+    // instead of a blocklist: keep printable ASCII (Latin letters/digits/punctuation)
+    // plus a small set of common typographic symbols worth preserving (° ₹ ± × µ – —),
+    // and remove everything else - whatever script or block it happens to be in.
+    //
     // Leftover artifacts from bilingual "Hindi / English" formatting are then cleaned up:
     //   - now-empty bracket/quote pairs, e.g. "Category ()" -> "Category", "text \"\"" -> "text"
     //   - stray separators (/ - : , * |) trimmed from the START/END only (looped until
@@ -1397,8 +1406,9 @@ class GeMBiddingDataExtractor {
     //     dates (e.g. "https://..." or "GEM/2025/B/123" pass through completely untouched).
     stripDevanagari(value) {
         if (!value) return value;
-        let result = value.replace(/[\u0900-\u097F]+/g, ' ');
-        // Collapse now-empty bracket/quote pairs left behind once Devanagari is removed
+        // Allowlist: tab/newline, printable ASCII (0x20-0x7E), and a few safe extras
+        let result = value.replace(/[^\t\n\x20-\x7E°₹±×µ–—]+/g, ' ');
+        // Collapse now-empty bracket/quote pairs left behind once junk is removed
         result = result
             .replace(/\(\s*\)/g, ' ')
             .replace(/\[\s*\]/g, ' ')
