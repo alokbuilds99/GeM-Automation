@@ -915,97 +915,115 @@ class GeMBiddingDataExtractor {
         return 'Ministry of Defence';
     }
 
-    // UPDATED: extractOrganizationName - Use same approach as extractBuyer
+    // REWRITTEN: extractOrganizationName - line-based, English-anchored. Real GeM PDFs
+    // format this row as "Organisation Name/<Devanagari label> <English value>" all on
+    // ONE line, with no colon - e.g. "Organisation Name/संगठन का नाम North East Frontier
+    // Railway". The old regex required ":" or whitespace to follow "Name" directly, so it
+    // broke the moment it hit the "/". This version finds the label by its English text
+    // only (reliable even when the nearby Devanagari is garbled by font/encoding issues),
+    // strips any non-English junk from that line, then removes the label itself - what's
+    // left is the value.
     extractOrganizationName(text) {
-        // Look for Organisation Name patterns in the bid details table
-        const organizationPatterns = [
-            /Organisation\s+Name[:\s]*([A-Za-z\s&]+)/i,
-            /Organization\s+Name[:\s]*([A-Za-z\s&]+)/i,
-            /संगठन\s+का\s+नाम[:\s]*([A-Za-z\s&]+)/i
-        ];
+        const lines = text.split('\n')
+            .map(l => l.replace(/[\u00A0\u200B\uFEFF]/g, ' ').replace(/\s+/g, ' ').trim())
+            .filter(l => l.length > 0);
 
-        for (const pattern of organizationPatterns) {
-            const match = text.match(pattern);
-            if (match) {
-                let organization = match[1].trim();
-                
-                // Clean up the organization name
-                organization = organization.replace(/\s*Office\s+Name\s*$/i, '');
-                organization = organization.replace(/\s*Buyer\s+Email\s*$/i, '');
-                organization = organization.replace(/[,\s]+$/, '').trim();
-                
-                if (organization.length > 3) {
-                    console.log('Found organization:', organization);
-                    return organization;
+        const labelRegex = /organi[sz]ation\s+name/i;
+        const stopRegex = /office\s+name|buyer\s+email|total\s+quantity/i;
+
+        for (let i = 0; i < lines.length; i++) {
+            if (!labelRegex.test(lines[i])) continue;
+
+            // Same line: strip non-English junk, remove the label, trim leftover separators
+            const cleaned = this.stripDevanagari(lines[i]);
+            let remainder = cleaned.replace(labelRegex, '').replace(/^[\/:\-\s]+/, '').trim();
+
+            if (remainder.length > 3 && !stopRegex.test(remainder)) {
+                console.log('Found organization:', remainder);
+                return remainder;
+            }
+
+            // Value might instead sit on its own line right below the label
+            if (i + 1 < lines.length) {
+                const next = this.stripDevanagari(lines[i + 1]).trim();
+                if (next.length > 3 && !stopRegex.test(next)) {
+                    console.log('Found organization (next line):', next);
+                    return next;
                 }
             }
         }
-        
+
         // Fallback: look for specific organization patterns
         const specificOrganizations = [
             'Indian Navy',
-            'Indian Army', 
+            'Indian Army',
             'Indian Air Force',
             'Goa Shipyard Limited',
             'Hpcl Rajasthan Refinery Limited'
         ];
-        
+
         for (const org of specificOrganizations) {
             if (text.includes(org)) {
                 console.log('Found organization from pattern:', org);
                 return org;
             }
         }
-        
+
         console.log('No organization found, using default');
         return '-';
     }
 
-    // UPDATED: extractBuyer - Keep the same approach but clean up the logic
+    // REWRITTEN: extractBuyer - same line-based English-anchor approach as
+    // extractOrganizationName. The old version looked for a literal "Department Of ..."
+    // phrase, which only exists for Ministry-of-Defence-style bids; for a document like
+    // "Department Name/वभाग का नाम Indian Railways" there's no "Department Of" anywhere,
+    // so it fell through to a hardcoded Defence default - wrong for every other ministry
+    // (Railways, Petroleum, etc.). This now reads the actual value next to the label.
     extractBuyer(text) {
-        // Look for Department Name patterns in the bid details table
-        const departmentPatterns = [
-            /Department\s+Of\s+[A-Za-z\s&]+/i,
-            /Department\s+[A-Za-z\s&]+/i
-        ];
+        const lines = text.split('\n')
+            .map(l => l.replace(/[\u00A0\u200B\uFEFF]/g, ' ').replace(/\s+/g, ' ').trim())
+            .filter(l => l.length > 0);
 
-        for (const pattern of departmentPatterns) {
-            const match = text.match(pattern);
-            if (match) {
-                let buyer = match[0].trim();
-                
-                // Clean up the buyer name - remove field labels
-                buyer = buyer.replace(/\s*Department\s+Name\s*$/i, '');
-                buyer = buyer.replace(/\s*Organisation\s+Name\s*$/i, '');
-                buyer = buyer.replace(/\s*Office\s+Name\s*$/i, '');
-                buyer = buyer.replace(/\s*Buyer\s+Email\s*$/i, '');
-                
-                // Remove any trailing commas or extra spaces
-                buyer = buyer.replace(/[,\s]+$/, '').trim();
-                
-                if (buyer.length > 5) {
-                    console.log('Found buyer:', buyer);
-                    return buyer;
+        const labelRegex = /department\s+name/i;
+        const stopRegex = /organi[sz]ation\s+name|office\s+name|total\s+quantity/i;
+
+        for (let i = 0; i < lines.length; i++) {
+            if (!labelRegex.test(lines[i])) continue;
+
+            const cleaned = this.stripDevanagari(lines[i]);
+            let remainder = cleaned.replace(labelRegex, '').replace(/^[\/:\-\s]+/, '').trim();
+
+            if (remainder.length > 3 && !stopRegex.test(remainder)) {
+                console.log('Found buyer/department:', remainder);
+                return remainder;
+            }
+
+            if (i + 1 < lines.length) {
+                const next = this.stripDevanagari(lines[i + 1]).trim();
+                if (next.length > 3 && !stopRegex.test(next)) {
+                    console.log('Found buyer/department (next line):', next);
+                    return next;
                 }
             }
         }
-        
+
         // Fallback: look for specific department patterns
         const specificDepartments = [
             'Department of Military Affairs',
             'Department of Defence Production',
-            'Department of Petroleum and Natural Gas'
+            'Department of Petroleum and Natural Gas',
+            'Indian Railways'
         ];
-        
+
         for (const dept of specificDepartments) {
             if (text.includes(dept)) {
                 console.log('Found department from pattern:', dept);
                 return dept;
             }
         }
-        
-        console.log('No buyer found, using default');
-        return 'Department of Military Affairs';
+
+        console.log('No buyer/department found, using default');
+        return 'Not Found';
     }
 
     // UPDATED: extractDataFromText - Add Ministry column and use new extraction functions
@@ -1343,7 +1361,12 @@ class GeMBiddingDataExtractor {
             line.includes('एमएसएमई') ||
             line.includes('Startup Relaxation') ||
             line.includes('स्टाट%अप') ||
-            line.includes('टाट%अप');
+            line.includes('टाट%अप') ||
+            /gemarpts/i.test(line); // actual next field in real PDFs
+
+        // Row immediately BEFORE Item Category - used to know where a wrapped value that
+        // got centered ABOVE the label line should stop being collected backward
+        const prevFieldMarker = (line) => /total\s+quantity/i.test(line);
 
         let labelLineIdx = -1;
         for (let i = 0; i < lines.length; i++) {
@@ -1358,24 +1381,45 @@ class GeMBiddingDataExtractor {
             return 'Not Found';
         }
 
+        // PDF.js reconstructs lines purely by Y-position, and when this field's
+        // description is long enough to need many wrapped lines, the (short) "Item
+        // Category" label ends up vertically centered - meaning it lands somewhere in
+        // the MIDDLE of the wrapped value rather than above it. Without this backward
+        // scan, everything before the label line (often several sentences - "item 1",
+        // "item 2", part of "item 3") is silently dropped. We scan backward from the
+        // label until we hit the real previous field ("Total Quantity") or a stop marker.
+        const prefixParts = [];
+        for (let i = labelLineIdx - 1; i >= 0 && prefixParts.length < 10; i--) {
+            if (prevFieldMarker(lines[i]) || labelIsStop(lines[i])) break;
+            prefixParts.unshift(lines[i]);
+        }
+
         // Value may continue on the same line as the label (after the label text) and/or
         // on the following lines, up to (but not including) the next field's label line
         const labelLine = lines[labelLineIdx];
-        const valueParts = [];
+        const valueParts = [...prefixParts];
 
-        // Text after "Item Category" on the same line, if any
+        // Text after "Item Category" on the same line, if any. The label itself is
+        // bilingual ("Item Category/मद केटेगरी"), so the raw remainder starts with
+        // "/<Devanagari>" before the real value text begins - clean that off here so it
+        // doesn't leave a stray "/" sitting in the middle of the final joined value.
         const sameLineIdx = labelLine.indexOf('Item Category');
         if (sameLineIdx !== -1) {
-            const remainder = labelLine.substring(sameLineIdx + 'Item Category'.length).trim();
+            let remainder = labelLine.substring(sameLineIdx + 'Item Category'.length).trim();
+            remainder = this.stripDevanagari(remainder);
             if (remainder) valueParts.push(remainder);
         }
 
-        // Collect subsequent lines until we hit the next known field, capped at a few
-        // lines so a mis-detected boundary can't swallow the rest of the document
-        const MAX_VALUE_LINES = 6;
-        for (let i = labelLineIdx + 1; i < lines.length && valueParts.length < MAX_VALUE_LINES; i++) {
+        // Collect subsequent lines until we hit the next known field, capped so a
+        // mis-detected boundary can't swallow the rest of the document. Counted
+        // separately from the prefix/same-line parts above so a long backward capture
+        // doesn't starve the forward capture (and vice versa).
+        const MAX_FORWARD_LINES = 10;
+        let forwardCount = 0;
+        for (let i = labelLineIdx + 1; i < lines.length && forwardCount < MAX_FORWARD_LINES; i++) {
             if (labelIsStop(lines[i])) break;
             valueParts.push(lines[i]);
+            forwardCount++;
         }
 
         let value = valueParts.join(' ').replace(/\s+/g, ' ').trim();
@@ -1491,8 +1535,9 @@ class GeMBiddingDataExtractor {
                 l.includes('mse relaxation') ||
                 line.includes('एमएसएमई') ||
                 l.includes('startup relaxation') ||
-                line.includes('स्टाट%अप') ||
-                line.includes('टाट%अप');
+                l.includes('time allowed for technical') || // actual next field
+                l.includes('inspection required') ||
+                l.includes('evaluation method');
         };
 
         let labelLineIdx = -1;
@@ -1508,9 +1553,20 @@ class GeMBiddingDataExtractor {
             return 'Not Found';
         }
 
+        // Same centering issue as Item Category: when this label sits mid-way through a
+        // wrapped multi-line value, the first line(s) of the value land BEFORE the label
+        // line in the reconstructed text. Scan backward until the real previous field
+        // ("Type of Bid") or a stop marker, so that prefix isn't lost.
+        const prevFieldMarker = (line) => /type\s+of\s+bid/i.test(line);
+        const prefixParts = [];
+        for (let i = labelLineIdx - 1; i >= 0 && prefixParts.length < 6; i--) {
+            if (prevFieldMarker(lines[i]) || labelIsStop(lines[i])) break;
+            prefixParts.unshift(lines[i]);
+        }
+
         const labelLine = lines[labelLineIdx];
         const labelLineLower = labelLine.toLowerCase();
-        const valueParts = [];
+        const valueParts = [...prefixParts];
 
         let sameLineIdx = -1, markerLength = 0;
         for (const marker of markers) {
@@ -1522,10 +1578,16 @@ class GeMBiddingDataExtractor {
             if (remainder) valueParts.push(remainder);
         }
 
-        const MAX_VALUE_LINES = 4;
-        for (let i = labelLineIdx + 1; i < lines.length && valueParts.length < MAX_VALUE_LINES; i++) {
+        // Real descriptions can wrap across several lines (e.g. "...Heavy Duty Battery
+        // Detailed Description as per item 5 of the Specification" + "Document" as a
+        // 3rd wrapped line). Counted separately from the prefix/same-line parts above so
+        // a long backward capture doesn't starve this forward capture.
+        const MAX_FORWARD_LINES = 6;
+        let forwardCount = 0;
+        for (let i = labelLineIdx + 1; i < lines.length && forwardCount < MAX_FORWARD_LINES; i++) {
             if (labelIsStop(lines[i])) break;
             valueParts.push(lines[i]);
+            forwardCount++;
         }
 
         let value = valueParts.join(' ').replace(/\s+/g, ' ').trim();
@@ -1541,72 +1603,101 @@ class GeMBiddingDataExtractor {
         return 'Not Found';
     }
 
-    // NEW: extractRelevantCategories - captures "अधिसूचना के लिए चयनित प्रासंगिक श्रेणियाँ /
-    // Relevant Categories selected for notification". This can list more than one category,
-    // so we allow more lines and keep them newline-separated (mirrors how Item Category is
-    // stored when it holds multiple groups).
+    // REWRITTEN (v2): extractRelevantCategories - captures "अधिसूचना के लिए चयनित
+    // प्रासंगिक श्रेणियाँ / Relevant Categories selected for notification", a bulleted list
+    // that can hold several category names.
+    //
+    // KEY FIX: this field's 2-line bilingual label sits next to a TALLER, multi-line
+    // bulleted value. PDF.js reconstructs lines purely by Y-position, and because the
+    // (shorter) label is vertically centered next to the (taller) value, the label's own
+    // two lines land INTERLEAVED with the value's lines rather than before them, e.g.
+    // (each line below is one element of the reconstructed `lines` array, in this order):
+    //   "Molded Case Circuit Breakers..."        <- value line 1
+    //   "...श्रेणियाँ / Relevant"                  <- label line 1 (appears mid-value!)
+    //   "RCCB - Residual Current..."              <- value line 3
+    //   "Categories selected for notification"    <- label line 2
+    //   "per IS 12640"                            <- value line 4
+    //   "VRLA Batteries"                          <- value line 5
+    // A "take everything after the label" approach can never produce a complete, correct
+    // value here. Instead this finds both label fragments (confirming the field exists on
+    // the page), takes the bounded window from a few lines before the first fragment
+    // through the next real field's stop marker, and keeps every line in that window
+    // EXCEPT the label's own fragments and the previous field's keywords - preserving the
+    // original top-to-bottom order of everything else.
     extractRelevantCategories(text) {
         // Normalize invisible/odd whitespace (nbsp, zero-width space, BOM) that PDF.js
-        // sometimes emits, which would otherwise make an exact .includes() match fail.
+        // sometimes emits, which would otherwise make an exact match fail.
         const lines = text.split('\n')
             .map(l => l.replace(/[\u00A0\u200B\uFEFF]/g, ' ').replace(/\s+/g, ' ').trim())
             .filter(l => l.length > 0);
 
-        // Compare case-insensitively for the English markers (source PDFs are
-        // inconsistent about capitalization); Devanagari has no case so this is a no-op.
-        const markers = [
-            'relevant categories selected for notification',
-            'relevant categories',
-            'प्रासंगिक श्रेणियाँ',
-            'अधिसूचना के लिए'
+        const labelFragment1 = /\/\s*relevant\s*$/i;                        // end of label line 1
+        const labelFragment2 = /categories\s+selected\s+for\s+notification/i; // label line 2
+        const singleLineLabel = /relevant\s+categories/i;                    // non-wrapped layout
+        const prevFieldKeywords = /gemarpts|generated\s+in/i;                // field right before this one
+
+        const stopMarkers = [
+            /minimum\s+average\s+annual\s+turnover/i, // actual next field in real PDFs
+            /years\s+of\s+past\s+experience/i,
+            /mse\s+exemption/i,
+            /startup\s+exemption/i,
+            /document\s+required\s+from\s+seller/i,
+            /item\s+category/i,
+            /primary\s+product\s+category/i,
+            /technical\s+specifications/i,
+            /mse\s+relaxation/i,
+            /startup\s+relaxation/i
         ];
-        const labelIsStart = (line) => markers.some(m => line.toLowerCase().includes(m));
 
-        const labelIsStop = (line) => {
-            const l = line.toLowerCase();
-            return l.includes('item category') ||
-                line.includes('मद केटेगरी') ||
-                l.includes('primary product category') ||
-                line.includes('प्राथमिक उत्पाद श्रेणी') ||
-                l.includes('technical specifications') ||
-                l.includes('mse relaxation') ||
-                line.includes('एमएसएमई') ||
-                l.includes('startup relaxation') ||
-                line.includes('स्टाट%अप') ||
-                line.includes('टाट%अप');
-        };
-
-        let labelLineIdx = -1;
+        // Find label fragment 1 (the common, wrapped-label case)
+        let idx1 = -1;
         for (let i = 0; i < lines.length; i++) {
-            if (labelIsStart(lines[i])) {
-                labelLineIdx = i;
-                break;
+            if (labelFragment1.test(lines[i])) { idx1 = i; break; }
+        }
+        // Fall back to a single-line, non-wrapped label (different PDF layout)
+        let singleLine = false;
+        if (idx1 === -1) {
+            for (let i = 0; i < lines.length; i++) {
+                if (singleLineLabel.test(lines[i])) { idx1 = i; singleLine = true; break; }
             }
         }
-
-        if (labelLineIdx === -1) {
+        if (idx1 === -1) {
             console.log('No Relevant Categories label found');
             return 'Not Found';
         }
 
-        const labelLine = lines[labelLineIdx];
-        const labelLineLower = labelLine.toLowerCase();
+        // Confirm with label fragment 2, within a small window after fragment 1
+        let idx2 = -1;
+        if (!singleLine) {
+            for (let i = idx1 + 1; i < Math.min(lines.length, idx1 + 6); i++) {
+                if (labelFragment2.test(lines[i])) { idx2 = i; break; }
+            }
+        }
+
+        // End boundary: nearest real stop marker after the label
+        const searchFrom = idx2 !== -1 ? idx2 : idx1;
+        let endIdx = lines.length;
+        for (let i = searchFrom + 1; i < lines.length; i++) {
+            if (stopMarkers.some(p => p.test(lines[i]))) { endIdx = i; break; }
+        }
+
+        // Start boundary: a small fixed look-back before the label (covers value lines
+        // that got centered ahead of it), stopping early at the previous field's own text
+        const LOOKBACK = 2;
+        let startIdx = idx1;
+        for (let i = idx1 - 1; i >= Math.max(0, idx1 - LOOKBACK); i--) {
+            if (prevFieldKeywords.test(lines[i])) break;
+            startIdx = i;
+        }
+
         const valueParts = [];
-
-        let sameLineIdx = -1, markerLength = 0;
-        for (const marker of markers) {
-            const idx = labelLineLower.indexOf(marker);
-            if (idx !== -1) { sameLineIdx = idx; markerLength = marker.length; break; }
-        }
-        if (sameLineIdx !== -1) {
-            const remainder = labelLine.substring(sameLineIdx + markerLength).trim();
-            if (remainder) valueParts.push(remainder);
-        }
-
-        const MAX_VALUE_LINES = 10;
-        for (let i = labelLineIdx + 1; i < lines.length && valueParts.length < MAX_VALUE_LINES; i++) {
-            if (labelIsStop(lines[i])) break;
-            valueParts.push(lines[i]);
+        for (let i = startIdx; i < endIdx; i++) {
+            const line = lines[i];
+            if (labelFragment1.test(line)) continue;
+            if (labelFragment2.test(line)) continue;
+            if (singleLine && i === idx1) continue;
+            if (prevFieldKeywords.test(line)) continue;
+            valueParts.push(line);
         }
 
         // Note: Devanagari stripping (and dropping any resulting empty lines) now
