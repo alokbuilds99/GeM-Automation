@@ -281,6 +281,55 @@ class GeMBiddingDataExtractor {
         console.log('=== END DEBUG ===');
     }
 
+    // NEW: buildPageTextWithLines - Reconstructs real line breaks from PDF.js text items
+    // using their Y coordinates, instead of flattening an entire page into one line.
+    // GeM bid PDFs are tables, and the Item Category / Technical Specifications values
+    // sit on their own line below the field label - without this, all extraction that
+    // relies on line-by-line boundaries (stop patterns, section scanning) silently
+    // operates on one giant blob per page and fails to isolate the right fields.
+    buildPageTextWithLines(items) {
+        if (!items || items.length === 0) return '';
+
+        const yTolerance = 2; // points; items within this Y range are treated as same line
+
+        // Sort by Y (descending - PDF coordinate origin is bottom-left, so higher Y = higher on page),
+        // then by X for left-to-right reading order within a line
+        const sorted = [...items].sort((a, b) => {
+            const yDiff = b.transform[5] - a.transform[5];
+            if (Math.abs(yDiff) > yTolerance) return yDiff;
+            return a.transform[4] - b.transform[4];
+        });
+
+        const lines = [];
+        let currentLine = [];
+        let currentY = null;
+
+        for (const item of sorted) {
+            const y = item.transform[5];
+            if (currentY === null || Math.abs(y - currentY) <= yTolerance) {
+                currentLine.push(item);
+                currentY = currentY === null ? y : currentY;
+            } else {
+                lines.push(currentLine);
+                currentLine = [item];
+                currentY = y;
+            }
+        }
+        if (currentLine.length > 0) lines.push(currentLine);
+
+        return lines
+            .map(lineItems =>
+                lineItems
+                    .sort((a, b) => a.transform[4] - b.transform[4])
+                    .map(it => it.str)
+                    .join(' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+            )
+            .filter(l => l.length > 0)
+            .join('\n');
+    }
+
     async extractDataFromPDF(file) {
         try {
             if (typeof pdfjsLib === 'undefined') {
@@ -304,7 +353,10 @@ class GeMBiddingDataExtractor {
                     
                     // Get text content
                     const pageTextContent = await page.getTextContent();
-                    const pageTextStr = pageTextContent.items.map(item => item.str).join(' ');
+                    // IMPORTANT: build real per-row lines from item Y-coordinates rather than
+                    // flattening the whole page into a single line - table field values (Item
+                    // Category, Technical Specifications) live on their own line below the label
+                    const pageTextStr = this.buildPageTextWithLines(pageTextContent.items);
                     fullText += pageTextStr + '\n';
                     
                     // Helper function to get text context around a position
@@ -863,97 +915,115 @@ class GeMBiddingDataExtractor {
         return 'Ministry of Defence';
     }
 
-    // UPDATED: extractOrganizationName - Use same approach as extractBuyer
+    // REWRITTEN: extractOrganizationName - line-based, English-anchored. Real GeM PDFs
+    // format this row as "Organisation Name/<Devanagari label> <English value>" all on
+    // ONE line, with no colon - e.g. "Organisation Name/संगठन का नाम North East Frontier
+    // Railway". The old regex required ":" or whitespace to follow "Name" directly, so it
+    // broke the moment it hit the "/". This version finds the label by its English text
+    // only (reliable even when the nearby Devanagari is garbled by font/encoding issues),
+    // strips any non-English junk from that line, then removes the label itself - what's
+    // left is the value.
     extractOrganizationName(text) {
-        // Look for Organisation Name patterns in the bid details table
-        const organizationPatterns = [
-            /Organisation\s+Name[:\s]*([A-Za-z\s&]+)/i,
-            /Organization\s+Name[:\s]*([A-Za-z\s&]+)/i,
-            /संगठन\s+का\s+नाम[:\s]*([A-Za-z\s&]+)/i
-        ];
+        const lines = text.split('\n')
+            .map(l => l.replace(/[\u00A0\u200B\uFEFF]/g, ' ').replace(/\s+/g, ' ').trim())
+            .filter(l => l.length > 0);
 
-        for (const pattern of organizationPatterns) {
-            const match = text.match(pattern);
-            if (match) {
-                let organization = match[1].trim();
-                
-                // Clean up the organization name
-                organization = organization.replace(/\s*Office\s+Name\s*$/i, '');
-                organization = organization.replace(/\s*Buyer\s+Email\s*$/i, '');
-                organization = organization.replace(/[,\s]+$/, '').trim();
-                
-                if (organization.length > 3) {
-                    console.log('Found organization:', organization);
-                    return organization;
+        const labelRegex = /organi[sz]ation\s+name/i;
+        const stopRegex = /office\s+name|buyer\s+email|total\s+quantity/i;
+
+        for (let i = 0; i < lines.length; i++) {
+            if (!labelRegex.test(lines[i])) continue;
+
+            // Same line: strip non-English junk, remove the label, trim leftover separators
+            const cleaned = this.stripDevanagari(lines[i]);
+            let remainder = cleaned.replace(labelRegex, '').replace(/^[\/:\-\s]+/, '').trim();
+
+            if (remainder.length > 3 && !stopRegex.test(remainder)) {
+                console.log('Found organization:', remainder);
+                return remainder;
+            }
+
+            // Value might instead sit on its own line right below the label
+            if (i + 1 < lines.length) {
+                const next = this.stripDevanagari(lines[i + 1]).trim();
+                if (next.length > 3 && !stopRegex.test(next)) {
+                    console.log('Found organization (next line):', next);
+                    return next;
                 }
             }
         }
-        
+
         // Fallback: look for specific organization patterns
         const specificOrganizations = [
             'Indian Navy',
-            'Indian Army', 
+            'Indian Army',
             'Indian Air Force',
             'Goa Shipyard Limited',
             'Hpcl Rajasthan Refinery Limited'
         ];
-        
+
         for (const org of specificOrganizations) {
             if (text.includes(org)) {
                 console.log('Found organization from pattern:', org);
                 return org;
             }
         }
-        
+
         console.log('No organization found, using default');
         return '-';
     }
 
-    // UPDATED: extractBuyer - Keep the same approach but clean up the logic
+    // REWRITTEN: extractBuyer - same line-based English-anchor approach as
+    // extractOrganizationName. The old version looked for a literal "Department Of ..."
+    // phrase, which only exists for Ministry-of-Defence-style bids; for a document like
+    // "Department Name/वभाग का नाम Indian Railways" there's no "Department Of" anywhere,
+    // so it fell through to a hardcoded Defence default - wrong for every other ministry
+    // (Railways, Petroleum, etc.). This now reads the actual value next to the label.
     extractBuyer(text) {
-        // Look for Department Name patterns in the bid details table
-        const departmentPatterns = [
-            /Department\s+Of\s+[A-Za-z\s&]+/i,
-            /Department\s+[A-Za-z\s&]+/i
-        ];
+        const lines = text.split('\n')
+            .map(l => l.replace(/[\u00A0\u200B\uFEFF]/g, ' ').replace(/\s+/g, ' ').trim())
+            .filter(l => l.length > 0);
 
-        for (const pattern of departmentPatterns) {
-            const match = text.match(pattern);
-            if (match) {
-                let buyer = match[0].trim();
-                
-                // Clean up the buyer name - remove field labels
-                buyer = buyer.replace(/\s*Department\s+Name\s*$/i, '');
-                buyer = buyer.replace(/\s*Organisation\s+Name\s*$/i, '');
-                buyer = buyer.replace(/\s*Office\s+Name\s*$/i, '');
-                buyer = buyer.replace(/\s*Buyer\s+Email\s*$/i, '');
-                
-                // Remove any trailing commas or extra spaces
-                buyer = buyer.replace(/[,\s]+$/, '').trim();
-                
-                if (buyer.length > 5) {
-                    console.log('Found buyer:', buyer);
-                    return buyer;
+        const labelRegex = /department\s+name/i;
+        const stopRegex = /organi[sz]ation\s+name|office\s+name|total\s+quantity/i;
+
+        for (let i = 0; i < lines.length; i++) {
+            if (!labelRegex.test(lines[i])) continue;
+
+            const cleaned = this.stripDevanagari(lines[i]);
+            let remainder = cleaned.replace(labelRegex, '').replace(/^[\/:\-\s]+/, '').trim();
+
+            if (remainder.length > 3 && !stopRegex.test(remainder)) {
+                console.log('Found buyer/department:', remainder);
+                return remainder;
+            }
+
+            if (i + 1 < lines.length) {
+                const next = this.stripDevanagari(lines[i + 1]).trim();
+                if (next.length > 3 && !stopRegex.test(next)) {
+                    console.log('Found buyer/department (next line):', next);
+                    return next;
                 }
             }
         }
-        
+
         // Fallback: look for specific department patterns
         const specificDepartments = [
             'Department of Military Affairs',
             'Department of Defence Production',
-            'Department of Petroleum and Natural Gas'
+            'Department of Petroleum and Natural Gas',
+            'Indian Railways'
         ];
-        
+
         for (const dept of specificDepartments) {
             if (text.includes(dept)) {
                 console.log('Found department from pattern:', dept);
                 return dept;
             }
         }
-        
-        console.log('No buyer found, using default');
-        return 'Department of Military Affairs';
+
+        console.log('No buyer/department found, using default');
+        return 'Not Found';
     }
 
     // UPDATED: extractDataFromText - Add Ministry column and use new extraction functions
@@ -971,13 +1041,49 @@ class GeMBiddingDataExtractor {
             'Organization Name': this.extractOrganizationName(text),
             'Total Quantity': this.extractTotalQuantity(text),
             'Item Category': this.extractItemCategory(text),
-            'Searched Strings used in GeMARPTS': this.extractGeMARPTSSearchedStrings(text),
-            'Searched Result generated in GeMARPTS': this.extractGeMARPTSSearchedResult(text),
-            'Relevant Categories selected for notification': this.extractRelevantCategories(text),
-            'BOQ Title': this.extractBOQTitle(text),
+            'Primary Product Category': this.extractPrimaryProductCategory(text),
+            'Relevant Categories': this.extractRelevantCategories(text),
             'Technical Specification': this.extractTechnicalSpec(text),
             'Filename': filename // NEW: Add filename as last column
         };
+
+        // NEW: Clean every field, including the filename, so English/Latin text is kept
+        // wherever it exists AND "tofu box" junk from unmapped PDF fonts is always
+        // removed. If a field has NO English content at all, we keep its Devanagari text
+        // instead of showing "Not Found" - showing something real beats showing nothing.
+        // Multi-line values (e.g. Item Category, Relevant Categories) are cleaned
+        // line-by-line, so each line independently keeps its English if it has any, or
+        // its Devanagari if that's all it has; only truly empty/junk-only lines are
+        // dropped.
+        Object.keys(data).forEach(key => {
+            const value = data[key];
+            if (typeof value !== 'string') return;
+
+            if (key === 'Filename') {
+                // Preserve the file extension; only clean the base name.
+                const dotIdx = value.lastIndexOf('.');
+                const base = dotIdx > 0 ? value.substring(0, dotIdx) : value;
+                const ext = dotIdx > 0 ? value.substring(dotIdx) : '';
+                let cleanBase = this.cleanFieldValue(base);
+                // Filenames typically use underscores as separators; collapse any
+                // underscore/space runs left behind by cleanup (e.g.
+                // "बिड_फाइल_2025" -> "_ _2025" -> "2025") and trim stray edge underscores.
+                cleanBase = cleanBase.replace(/[\s_]+/g, '_').replace(/^_+|_+$/g, '');
+                data[key] = (cleanBase || 'Document') + ext;
+                return;
+            }
+
+            if (value.includes('\n')) {
+                data[key] = value
+                    .split('\n')
+                    .map(line => this.cleanFieldValue(line))
+                    .filter(line => line.length > 0)
+                    .join('\n');
+            } else {
+                data[key] = this.cleanFieldValue(value);
+            }
+            if (!data[key]) data[key] = 'Not Found';
+        });
 
         console.log('Extracted data:', data);
         return data;
@@ -1215,11 +1321,11 @@ class GeMBiddingDataExtractor {
         // Fallback: Look for traditional quantity patterns
         const quantityPatterns = [
             /Total\s+Quantity\/कुल\s+मात्रा\s*[:\-]?\s*(\d+)/i,
-            /Total\s+Quantity.*?[:\-]?\s*(\d{2,6})/i,
+            /Total\s+Quantity[\s\S]{0,20}?[:\-]?\s*(\d{2,6})/i,
             /कुल\s+मात्रा\s*[:\-]?\s*(\d+)/i,
-            /Quantity.*?[:\-]?\s*(\d{2,6})/i,
-            /Total\s+Qty.*?[:\-]?\s*(\d+)/i,
-            /Qty.*?[:\-]?\s*(\d+)/i
+            /Quantity[\s\S]{0,20}?[:\-]?\s*(\d{2,6})/i,
+            /Total\s+Qty[\s\S]{0,20}?[:\-]?\s*(\d+)/i,
+            /Qty[\s\S]{0,20}?[:\-]?\s*(\d+)/i
         ];
         
         for (const pattern of quantityPatterns) {
@@ -1235,355 +1341,539 @@ class GeMBiddingDataExtractor {
         return 'Not Found';
     }
 
-    // IMPROVED: extractItemCategory - Better extraction of specific product names like "Schneider Electric Compact"
+    // REWRITTEN (v2): extractItemCategory - The "Item Category" field in a real GeM bid
+    // table is a single value that sits on its own line right below the "Item Category"
+    // label (e.g. "MCB - Miniature Circuit - Breakers for A.C. Operation as per IS / IEC
+    // 60898 (Part 1) (Q2)" or "Occupancy sensor (Q3)") - it is NOT a multi-row section.
+    // This only works correctly once the PDF text has real line breaks (see
+    // buildPageTextWithLines), since the very next table row ("MSE Relaxation for Years
+    // of Experience and Turnover") is what bounds the value.
     extractItemCategory(text) {
-        const lines = text.split('\n');
-        const items = [];
-        
-        // Look for the actual item list section
-        let inItemSection = false;
-        let foundItems = false;
-        
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+        // Lines that mark the START of the field (label line)
+        const labelIsStart = (line) => line.includes('Item Category') || line.includes('मद केटेगरी');
+
+        // Lines that mark the row immediately AFTER Item Category in the standard GeM
+        // bid template - used to know where the value ends
+        const labelIsStop = (line) =>
+            line.includes('MSE Relaxation') ||
+            line.includes('एमएसएमई') ||
+            line.includes('Startup Relaxation') ||
+            line.includes('स्टाट%अप') ||
+            line.includes('टाट%अप') ||
+            /gemarpts/i.test(line) || // actual next field in real PDFs
+            // Item Category's value is always plain English - a line carrying real
+            // Devanagari belongs to the next field's bilingual label (see the matching
+            // note in extractPrimaryProductCategory for why this check matters even when
+            // parts of that label get corrupted into stray ASCII by the PDF's font).
+            /[\u0900-\u097F]/.test(line);
+
+        // Row immediately BEFORE Item Category - used to know where a wrapped value that
+        // got centered ABOVE the label line should stop being collected backward
+        const prevFieldMarker = (line) => /total\s+quantity/i.test(line);
+
+        let labelLineIdx = -1;
         for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            
-            // Look for the start of actual item specifications
-            if (line.includes('Item Category/') || 
-                line.includes('मद केटेगरी') ||
-                line.includes('VARIOUS TYPES OF ELECTRICAL SPARES') ||
-                line.includes('CIRCUIT BREAKER') ||
-                line.includes('Schneider Electric') ||
-                line.includes('Bid Details') && line.includes('बिड विवरण')) {
-                
-                inItemSection = true;
-                console.log('Found item section at line:', i, 'Content:', line);
-                continue;
-            }
-            
-            if (inItemSection) {
-                const lineClean = line.trim();
-                
-                // Stop when we hit policy sections or other non-item content
-                if (['Experience Criteria', 'Preference to Make In India', 'Purchase preference for MSEs', 
-                     'Estimated Bid Value', 'Past Performance', 'Technical Specifications',
-                     'Consignees/Reporting Officer', 'Buyer Added Bid', 'Input Tax Credit',
-                     'EMD Detail', 'Evaluation Method', 'Inspection Required', 'Advisory',
-                     'Searched Strings', 'Relevant Categories', 'MSE Exemption'].some(stop => 
-                     lineClean.includes(stop))) {
-                    console.log('Stopping at line:', i, 'due to:', lineClean);
-                    break;
-                }
-                
-                // Skip empty lines, page numbers, and noise
-                if (lineClean && 
-                    !/^\d+\s*\/\s*\d+$/.test(lineClean) &&
-                    !lineClean.includes('GeMARPTS') &&
-                    !lineClean.includes('Strings used in') &&
-                    !lineClean.includes('Result generated') &&
-                    !lineClean.includes('Categories selected') &&
-                    !lineClean.startsWith('मम') &&
-                    !lineClean.startsWith('अधिसूचना') &&
-                    lineClean.length > 10 &&
-                    !lineClean.includes('Policy') &&
-                    !lineClean.includes('criteria') &&
-                    !lineClean.includes('preference') &&
-                    !lineClean.includes('percentage') &&
-                    !lineClean.includes('registration') &&
-                    !lineClean.includes('financial year') &&
-                    !lineClean.includes('Advisory') &&
-                    !lineClean.includes('Department Name') &&
-                    !lineClean.includes('Organisation Name') &&
-                    !lineClean.includes('Office Name') &&
-                    !lineClean.includes('Buyer Email')) {
-                    
-                    // Clean up the line
-                    let cleanLine = lineClean;
-                    cleanLine = cleanLine.replace(/^\d+\.\s*/, ''); // Remove numbering
-                    cleanLine = cleanLine.replace(/^[^\w\s]*\s*/, ''); // Remove special chars at start
-                    cleanLine = cleanLine.replace(/\s+/g, ' ').trim(); // Normalize spaces
-                    
-                    if (cleanLine.length > 10 && cleanLine.length < 300) {
-                        // Check if this looks like an actual item (not policy text)
-                        const hasItemIndicators = 
-                            cleanLine.includes('PART NO.') ||
-                            cleanLine.includes('CIRCUIT BREAKER') ||
-                            cleanLine.includes('Schneider Electric') ||
-                            cleanLine.includes('Compact') ||
-                            cleanLine.includes('Switch') ||
-                            cleanLine.includes('Socket') ||
-                            cleanLine.includes('Plug') ||
-                            cleanLine.includes('Holder') ||
-                            cleanLine.includes('Cable') ||
-                            cleanLine.includes('Lamp') ||
-                            cleanLine.includes('Light') ||
-                            cleanLine.includes('Contactor') ||
-                            cleanLine.includes('Relay') ||
-                            cleanLine.includes('Timer') ||
-                            cleanLine.includes('Diode') ||
-                            cleanLine.includes('Insulation') ||
-                            cleanLine.includes('Capacitor') ||
-                            cleanLine.includes('Volt') ||
-                            cleanLine.includes('Amp') ||
-                            cleanLine.includes('Watt') ||
-                            cleanLine.includes('sq.mm') ||
-                            cleanLine.includes('mFD') ||
-                            cleanLine.includes('Hz') ||
-                            cleanLine.includes('Phase') ||
-                            cleanLine.includes('Pole') ||
-                            cleanLine.includes('Range') ||
-                            cleanLine.includes('Make') ||
-                            cleanLine.includes('Brand') ||
-                            cleanLine.includes('Model') ||
-                            cleanLine.includes('Type') ||
-                            cleanLine.includes('pieces') ||
-                            cleanLine.includes('units') ||
-                            cleanLine.includes('nos') ||
-                            cleanLine.includes('quantity') ||
-                            cleanLine.includes('qty');
-                        
-                        if (hasItemIndicators) {
-                            items.push(cleanLine);
-                            foundItems = true;
-                            console.log('Found item:', cleanLine);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // If we didn't find items in the main section, look for specific patterns
-        if (!foundItems) {
-            console.log('No categorized items found, looking for specific patterns...');
-            
-            // Look for Schneider Electric patterns
-            const schneiderPatterns = [
-                /Schneider\s+Electric\s+[A-Za-z\s]+\(\s*\d+\s*pieces?\s*\)/gi,
-                /Schneider\s+Electric\s+[A-Za-z\s]+/gi,
-                /Compact\s*\(\s*\d+\s*pieces?\s*\)/gi
-            ];
-            
-            for (const pattern of schneiderPatterns) {
-                const matches = text.match(pattern);
-                if (matches) {
-                    items.push(...matches);
-                    foundItems = true;
-                    console.log('Found Schneider Electric pattern:', matches);
-                }
-            }
-            
-            // Look for circuit breaker patterns
-            const circuitBreakerPatterns = [
-                /CIRCUIT\s+BREAKER\s+[A-Z\s]+PART\s+NO\.\s+[A-Z0-9]+/gi,
-                /Circuit\s+Breaker\s+[A-Za-z\s]+Part\s+No\.\s+[A-Z0-9]+/gi,
-                /[A-Z]+\s+PART\s+NO\.\s+[A-Z0-9]+/gi
-            ];
-            
-            for (const pattern of circuitBreakerPatterns) {
-                const matches = text.match(pattern);
-                if (matches) {
-                    items.push(...matches);
-                    foundItems = true;
-                    console.log('Found circuit breaker pattern:', matches);
-                }
-            }
-            
-            // Look for other electrical component patterns
-            const electricalPatterns = [
-                /Switch.*?Socket.*?\d+V.*?\d+A/gi,
-                /Plug.*?Top.*?\d+A/gi,
-                /Holder.*?BC.*?Brass/gi,
-                /Insulation.*?Tape.*?\d+.*?Mtr/gi,
-                /Capacitor.*?\d+.*?mFD.*?\d+V/gi,
-                /Tube.*?Light.*?Holder/gi,
-                /Lamp.*?\d+V.*?\d+W/gi,
-                /Cable.*?\d+.*?sq\.mm.*?Copper/gi,
-                /Contactor.*?\d+V.*?Coil/gi,
-                /Relay.*?range.*?\d+.*?\d+A/gi,
-                /Timer.*?Range.*?\d+.*?\d+S/gi,
-                /Diode.*?battery.*?Charge/gi,
-                /Cable.*?Lugs.*?SIZE.*?\d+.*?Sq\.mm/gi
-            ];
-            
-            for (const pattern of electricalPatterns) {
-                const matches = text.match(pattern);
-                if (matches) {
-                    items.push(...matches);
-                    foundItems = true;
-                }
-            }
-        }
-        
-        // Format the found items
-        if (items.length > 0) {
-            // Clean and deduplicate items
-            const cleanItems = [...new Set(items)]
-                .filter(item => item.length > 10 && item.length < 300)
-                .slice(0, 20); // Limit to first 20 items
-            
-            console.log('Found items:', cleanItems.length);
-            return cleanItems.join(' | ');
-        }
-        
-        console.log('No items found');
-        return 'No items found - may be policy document or scanned image';
-    }
-
-    // NEW FUNCTIONS: the four bid-details rows that sit together under Item Category
-    //   GeMARPTS में खोजी गई स्ट्रिंग / Searched Strings used in GeMARPTS
-    //   GeMARPTS में खोजा गया परिणाम / Searched Result generated in GeMARPTS
-    //   अधिसूचना के लिए चयनित प्रासंगिक श्रेणियाँ / Relevant Categories selected for notification
-    //   BOQ Title/बीओक्यू शीर्षक
-    // Each one matches on the English half of its label only: the Hindi half often comes out of
-    // PDF.js with broken glyphs, so it cannot be matched reliably.
-    extractGeMARPTSSearchedStrings(text) {
-        return this.extractBidDetailRow(text, 'Searched Strings used in GeMARPTS',
-            /Searched\s+Strings?\s+used\s+in\s+GeM\s*ARPTS/gi);
-    }
-
-    extractGeMARPTSSearchedResult(text) {
-        return this.extractBidDetailRow(text, 'Searched Result generated in GeMARPTS',
-            /Searched\s+Results?\s+generated\s+in\s+GeM\s*ARPTS/gi);
-    }
-
-    extractRelevantCategories(text) {
-        return this.extractBidDetailRow(text, 'Relevant Categories selected for notification',
-            /Relevant\s+Categor(?:y|ies)\s+selected\s+for\s+notification/gi);
-    }
-
-    extractBOQTitle(text) {
-        // This label is English-first, so its Hindi half sits between the label and the value
-        return this.extractBidDetailRow(text, 'BOQ Title', /BOQ\s+Title/gi,
-            { hindiAfterLabel: /^बीओक्यू\s+शीर्षक/ });
-    }
-
-    // Shared reader for a label/value row of the bid-details table: returns the text between
-    // the given label and the label of whichever row comes next.
-    extractBidDetailRow(text, fieldName, labelRegex, options = {}) {
-        // Labels of the rows that can come next; the value ends at whichever appears first.
-        // The first three are written Hindi-first in the PDF, so their patterns also swallow the
-        // (possibly garbled) Hindi text sitting in front of the English words.
-        const stopPatterns = [
-            /GeM\s*ARPTS[^A-Za-z0-9]*Searched\s+Strings?\s+used\s+in\s+GeM\s*ARPTS/i,
-            /GeM\s*ARPTS[^A-Za-z0-9]*Searched\s+Results?\s+generated\s+in\s+GeM\s*ARPTS/i,
-            /(?:(?:^|\s)[^\x00-\x7F][^A-Za-z0-9]*)?Relevant\s+Categor(?:y|ies)\s+selected\s+for\s+notification/i,
-            /Searched\s+Strings?\s+used\s+in\s+GeM\s*ARPTS/i,
-            /Searched\s+Results?\s+generated\s+in\s+GeM\s*ARPTS/i,
-            /BOQ\s+Title\s*\//i,
-            /Item\s+Category\s*\//i,
-            /Total\s+Quantity\s*\//i,
-            /Contract\s+Period\s*\//i,
-            /MSE\s+(?:Exemption|Relaxation)\s+for\s+Years/i,
-            /Startup\s+(?:Exemption|Relaxation)\s+for\s+Years/i,
-            /Minimum\s+Average\s+Annual\s+Turnover/i,
-            /OEM\s+Average\s+Turnover/i,
-            /Years\s+of\s+Past\s+Experience\s+Required/i,
-            /Past\s+Experience\s+of\s+Similar\s+Services/i,
-            /Document\s+required\s+from\s+seller/i,
-            /Do\s+you\s+want\s+to\s+show\s+documents/i,
-            /Bid\s+to\s+RA\s+enabled/i,
-            /RA\s+Qualification\s+Rule/i,
-            /Type\s+of\s+Bid\s*\//i,
-            /Time\s+allowed\s+for\s+Technical\s+Clarifications/i,
-            /Inspection\s+Required/i,
-            /Evaluation\s+Method\s*\//i,
-            /Estimated\s+Bid\s+Value/i,
-            /Arbitration\s+Clause/i,
-            /Mediation\s+Clause/i,
-            /Primary\s+product\s+category/i,
-            /Bid\s+Offer\s+Validity/i,
-            /EMD\s+Detail/i,
-            /ePBG\s+Detail/i
-        ];
-
-        const windowSize = 2000;   // how far past the label to look for the next row
-        const maxFallbackLength = 500;
-
-        labelRegex.lastIndex = 0;
-        let labelMatch;
-        while ((labelMatch = labelRegex.exec(text)) !== null) {
-            const afterLabel = text.substr(labelMatch.index + labelMatch[0].length, windowSize);
-
-            // Find the nearest following row label
-            let stopIndex = -1;
-            for (const stop of stopPatterns) {
-                const stopMatch = afterLabel.match(stop);
-                if (stopMatch && (stopIndex === -1 || stopMatch.index < stopIndex)) {
-                    stopIndex = stopMatch.index;
-                }
-            }
-
-            let value;
-            if (stopIndex !== -1) {
-                value = afterLabel.substring(0, stopIndex);
-            } else {
-                // No known label after it: take the rest of the page (pages are joined with \n)
-                console.log(`${fieldName}: no following row label found, using rest of page`);
-                value = afterLabel.replace(/^\s+/, '').split('\n')[0].substring(0, maxFallbackLength);
-            }
-
-            // Tidy up: separators left over from the table cell, repeated whitespace
-            value = value
-                .replace(/\s+/g, ' ')
-                .replace(/^[\s:\-–|\/]+/, '')
-                .replace(/[\s:\/|]+$/, '')
-                .trim();
-
-            // English-first label: drop the Hindi half of the label from the front of the value
-            if (options.hindiAfterLabel) {
-                if (options.hindiAfterLabel.test(value)) {
-                    value = value.replace(options.hindiAfterLabel, '');
-                } else {
-                    // Garbled Hindi: drop leading words that contain non-English characters
-                    const words = value.split(' ');
-                    while (words.length > 0 && /[^\x00-\x7F]/.test(words[0])) {
-                        words.shift();
-                    }
-                    value = words.join(' ');
-                }
-                value = value.replace(/^[\s:\-–|\/]+/, '').trim();
-            }
-
-            if (value.length > 0) {
-                console.log(`Found ${fieldName}:`, value);
-                return value;
+            if (labelIsStart(lines[i])) {
+                labelLineIdx = i;
+                break;
             }
         }
 
-        // Help diagnose PDFs where the row exists but its label came out in an unexpected shape
-        const hintIndex = text.search(new RegExp(fieldName.split(' ')[0], 'i'));
-        if (hintIndex !== -1) {
-            console.log(`${fieldName}: no value could be read. Nearby text:`,
-                text.substring(Math.max(0, hintIndex - 100), hintIndex + 400));
-        } else {
-            console.log(`${fieldName}: row not present in this PDF`);
+        if (labelLineIdx === -1) {
+            console.log('No Item Category label found');
+            return 'Not Found';
         }
+
+        // PDF.js reconstructs lines purely by Y-position, and when this field's
+        // description is long enough to need many wrapped lines, the (short) "Item
+        // Category" label ends up vertically centered - meaning it lands somewhere in
+        // the MIDDLE of the wrapped value rather than above it. Without this backward
+        // scan, everything before the label line (often several sentences - "item 1",
+        // "item 2", part of "item 3") is silently dropped. We scan backward from the
+        // label until we hit the real previous field ("Total Quantity") or a stop marker.
+        const prefixParts = [];
+        for (let i = labelLineIdx - 1; i >= 0 && prefixParts.length < 10; i--) {
+            if (prevFieldMarker(lines[i]) || labelIsStop(lines[i])) break;
+            prefixParts.unshift(lines[i]);
+        }
+
+        // Value may continue on the same line as the label (after the label text) and/or
+        // on the following lines, up to (but not including) the next field's label line
+        const labelLine = lines[labelLineIdx];
+        const valueParts = [...prefixParts];
+
+        // Text after "Item Category" on the same line, if any. The label itself is
+        // bilingual ("Item Category/मद केटेगरी"), so the raw remainder starts with
+        // "/<Devanagari>" before the real value text begins - clean that off here so it
+        // doesn't leave a stray "/" sitting in the middle of the final joined value.
+        const sameLineIdx = labelLine.indexOf('Item Category');
+        if (sameLineIdx !== -1) {
+            let remainder = labelLine.substring(sameLineIdx + 'Item Category'.length).trim();
+            remainder = this.stripDevanagari(remainder);
+            if (remainder) valueParts.push(remainder);
+        }
+
+        // Collect subsequent lines until we hit the next known field, capped so a
+        // mis-detected boundary can't swallow the rest of the document. Counted
+        // separately from the prefix/same-line parts above so a long backward capture
+        // doesn't starve the forward capture (and vice versa).
+        const MAX_FORWARD_LINES = 10;
+        let forwardCount = 0;
+        for (let i = labelLineIdx + 1; i < lines.length && forwardCount < MAX_FORWARD_LINES; i++) {
+            if (labelIsStop(lines[i])) break;
+            valueParts.push(lines[i]);
+            forwardCount++;
+        }
+
+        let value = valueParts.join(' ').replace(/\s+/g, ' ').trim();
+        value = value.replace(/^[\/:\-\s]+/, '').trim(); // strip leading separators
+
+        if (value.length >= 2) {
+            console.log('Extracted Item Category:', value);
+            return value;
+        }
+
+        console.log('Item Category label found but no value captured');
         return 'Not Found';
     }
 
-    // Extract technical specification URL from PDF text
+    // NEW: stripDevanagari - removes Devanagari script (Hindi) characters AND any other
+    // non-Latin/unprintable glyphs from a value, so NO Devanagari and no "tofu box" (□)
+    // junk ever reaches the Excel file - only the English/Latin portion survives.
+    //
+    // Some GeM PDFs embed custom Indic fonts whose glyphs pdf.js can't map to real
+    // Unicode Devanagari code points; those extract as Private-Use-Area / unmapped
+    // characters that render as empty boxes (□□□M □□M ...) instead of being caught by
+    // the standard Devanagari-block filter. To catch those too, this uses an ALLOWLIST
+    // instead of a blocklist: keep printable ASCII (Latin letters/digits/punctuation)
+    // plus a small set of common typographic symbols worth preserving (° ₹ ± × µ – —),
+    // and remove everything else - whatever script or block it happens to be in.
+    //
+    // Leftover artifacts from bilingual "Hindi / English" formatting are then cleaned up:
+    //   - now-empty bracket/quote pairs, e.g. "Category ()" -> "Category", "text \"\"" -> "text"
+    //   - stray separators (/ - : , * |) trimmed from the START/END only (looped until
+    //     stable), never collapsed mid-string, so this is safe to run on URLs, IDs and
+    //     dates (e.g. "https://..." or "GEM/2025/B/123" pass through completely untouched).
+    stripDevanagari(value) {
+        if (!value) return value;
+        // Allowlist: tab/newline, printable ASCII (0x20-0x7E), and a few safe extras
+        let result = value.replace(/[^\t\n\x20-\x7E°₹±×µ–—]+/g, ' ');
+        // Collapse now-empty bracket/quote pairs left behind once junk is removed
+        result = result
+            .replace(/\(\s*\)/g, ' ')
+            .replace(/\[\s*\]/g, ' ')
+            .replace(/\{\s*\}/g, ' ')
+            .replace(/["'“”‘’]\s*["'“”‘’]/g, ' ');
+        result = result.replace(/\s+/g, ' ').trim();
+        let prev;
+        do {
+            prev = result;
+            // Only apply the trim if it leaves real content behind - a value made
+            // ENTIRELY of separator chars (e.g. "-" used as a placeholder for
+            // "not found") is meaningful content, not an artifact, and must survive.
+            const trimmed = result.replace(/^[\/\-:,*|]+\s*/, '').replace(/\s*[\/\-:,*|]+$/, '').trim();
+            if (trimmed.length > 0) result = trimmed;
+        } while (result !== prev);
+        return result;
+    }
+
+    // NEW: cleanPreservingDevanagari - fallback cleaner used ONLY when a value has NO
+    // English/Latin content at all (stripDevanagari would leave it empty). In that case,
+    // rather than showing "Not Found", we keep the Devanagari text itself - it's the only
+    // content available for that field. This still strips the "tofu box" (□) junk glyphs
+    // from unmapped PDF fonts (Private Use Area / Specials blocks), since those are never
+    // real text either way, but genuine Devanagari script is preserved.
+    cleanPreservingDevanagari(value) {
+        if (!value) return value;
+        let result = value.replace(
+            /[^\t\n\x20-\x7E\u0900-\u097F\u1CD0-\u1CFF\uA8E0-\uA8FF°₹±×µ–—]+/g, ' '
+        );
+        result = result
+            .replace(/\(\s*\)/g, ' ')
+            .replace(/\[\s*\]/g, ' ')
+            .replace(/\{\s*\}/g, ' ')
+            .replace(/["'“”‘’]\s*["'“”‘’]/g, ' ');
+        result = result.replace(/\s+/g, ' ').trim();
+        let prev;
+        do {
+            prev = result;
+            const trimmed = result.replace(/^[\/\-:,*|]+\s*/, '').replace(/\s*[\/\-:,*|]+$/, '').trim();
+            if (trimmed.length > 0) result = trimmed;
+        } while (result !== prev);
+        return result;
+    }
+
+    // NEW: cleanFieldValue - runs stripDevanagari (English/Latin only) first; if that
+    // leaves nothing (the source text had no English at all for this value), falls back
+    // to cleanPreservingDevanagari so the Devanagari content is shown instead of losing
+    // the field entirely.
+    cleanFieldValue(raw) {
+        const latinOnly = this.stripDevanagari(raw);
+        if (latinOnly) return latinOnly;
+        return this.cleanPreservingDevanagari(raw);
+    }
+
+    // NEW: extractPrimaryProductCategory - captures the "प्राथमिक उत्पाद श्रेणी / Primary
+    // product category" field. Same shape as Item Category: a single value sitting on its
+    // own line right below (or after) the bilingual label.
+    extractPrimaryProductCategory(text) {
+        // Normalize invisible/odd whitespace (nbsp, zero-width space, BOM) that PDF.js
+        // sometimes emits, which would otherwise make an exact .includes() match fail.
+        const lines = text.split('\n')
+            .map(l => l.replace(/[\u00A0\u200B\uFEFF]/g, ' ').replace(/\s+/g, ' ').trim())
+            .filter(l => l.length > 0);
+
+        // Compare case-insensitively for the English marker (source PDFs are inconsistent
+        // about capitalization); Devanagari has no case so this is a no-op for it.
+        const markers = ['primary product category', 'प्राथमिक उत्पाद श्रेणी'];
+        const labelIsStart = (line) => markers.some(m => line.toLowerCase().includes(m));
+
+        const labelIsStop = (line) => {
+            const l = line.toLowerCase();
+            return l.includes('item category') ||
+                line.includes('मद केटेगरी') ||
+                l.includes('relevant categories') ||
+                line.includes('प्रासंगिक श्रेणियाँ') ||
+                l.includes('technical specifications') ||
+                l.includes('mse relaxation') ||
+                line.includes('एमएसएमई') ||
+                l.includes('startup relaxation') ||
+                l.includes('time allowed for technical') || // actual next field
+                l.includes('inspection required') ||
+                l.includes('evaluation method') ||
+                // This field's value is always a plain English product description, so
+                // any line carrying real Devanagari text belongs to the NEXT field's
+                // (possibly wrapped/interleaved) bilingual label - even when some of that
+                // label's characters got corrupted by a custom PDF font into stray ASCII
+                // letters/digits that an allowlist filter can't tell apart from real
+                // content, enough genuine Devanagari usually survives on that same line
+                // to catch it here, before the corruption has a chance to leak in.
+                /[\u0900-\u097F]/.test(line);
+        };
+
+        let labelLineIdx = -1;
+        for (let i = 0; i < lines.length; i++) {
+            if (labelIsStart(lines[i])) {
+                labelLineIdx = i;
+                break;
+            }
+        }
+
+        if (labelLineIdx === -1) {
+            console.log('No Primary product category label found');
+            return 'Not Found';
+        }
+
+        // Same centering issue as Item Category: when this label sits mid-way through a
+        // wrapped multi-line value, the first line(s) of the value land BEFORE the label
+        // line in the reconstructed text. Scan backward until the real previous field
+        // ("Type of Bid") or a stop marker, so that prefix isn't lost.
+        const prevFieldMarker = (line) => /type\s+of\s+bid/i.test(line);
+        const prefixParts = [];
+        for (let i = labelLineIdx - 1; i >= 0 && prefixParts.length < 6; i--) {
+            if (prevFieldMarker(lines[i]) || labelIsStop(lines[i])) break;
+            prefixParts.unshift(lines[i]);
+        }
+
+        const labelLine = lines[labelLineIdx];
+        const labelLineLower = labelLine.toLowerCase();
+        const valueParts = [...prefixParts];
+
+        let sameLineIdx = -1, markerLength = 0;
+        for (const marker of markers) {
+            const idx = labelLineLower.indexOf(marker);
+            if (idx !== -1) { sameLineIdx = idx; markerLength = marker.length; break; }
+        }
+        if (sameLineIdx !== -1) {
+            const remainder = labelLine.substring(sameLineIdx + markerLength).trim();
+            if (remainder) valueParts.push(remainder);
+        }
+
+        // Real descriptions can wrap across several lines (e.g. "...Heavy Duty Battery
+        // Detailed Description as per item 5 of the Specification" + "Document" as a
+        // 3rd wrapped line). Counted separately from the prefix/same-line parts above so
+        // a long backward capture doesn't starve this forward capture.
+        const MAX_FORWARD_LINES = 6;
+        let forwardCount = 0;
+        for (let i = labelLineIdx + 1; i < lines.length && forwardCount < MAX_FORWARD_LINES; i++) {
+            if (labelIsStop(lines[i])) break;
+            valueParts.push(lines[i]);
+            forwardCount++;
+        }
+
+        let value = valueParts.join(' ').replace(/\s+/g, ' ').trim();
+        value = value.replace(/^[\/:\-\s]+/, '').trim();
+        // Note: Devanagari stripping now happens centrally in extractDataFromText
+
+        if (value.length >= 2) {
+            console.log('Extracted Primary product category:', value);
+            return value;
+        }
+
+        console.log('Primary product category label found but no value captured');
+        return 'Not Found';
+    }
+
+    // REWRITTEN (v2): extractRelevantCategories - captures "अधिसूचना के लिए चयनित
+    // प्रासंगिक श्रेणियाँ / Relevant Categories selected for notification", a bulleted list
+    // that can hold several category names.
+    //
+    // KEY FIX: this field's 2-line bilingual label sits next to a TALLER, multi-line
+    // bulleted value. PDF.js reconstructs lines purely by Y-position, and because the
+    // (shorter) label is vertically centered next to the (taller) value, the label's own
+    // two lines land INTERLEAVED with the value's lines rather than before them, e.g.
+    // (each line below is one element of the reconstructed `lines` array, in this order):
+    //   "Molded Case Circuit Breakers..."        <- value line 1
+    //   "...श्रेणियाँ / Relevant"                  <- label line 1 (appears mid-value!)
+    //   "RCCB - Residual Current..."              <- value line 3
+    //   "Categories selected for notification"    <- label line 2
+    //   "per IS 12640"                            <- value line 4
+    //   "VRLA Batteries"                          <- value line 5
+    // A "take everything after the label" approach can never produce a complete, correct
+    // value here. Instead this finds both label fragments (confirming the field exists on
+    // the page), takes the bounded window from a few lines before the first fragment
+    // through the next real field's stop marker, and keeps every line in that window
+    // EXCEPT the label's own fragments and the previous field's keywords - preserving the
+    // original top-to-bottom order of everything else.
+    extractRelevantCategories(text) {
+        // Normalize invisible/odd whitespace (nbsp, zero-width space, BOM) that PDF.js
+        // sometimes emits, which would otherwise make an exact match fail.
+        const lines = text.split('\n')
+            .map(l => l.replace(/[\u00A0\u200B\uFEFF]/g, ' ').replace(/\s+/g, ' ').trim())
+            .filter(l => l.length > 0);
+
+        const labelFragment1 = /\/\s*relevant\s*$/i;                        // end of label line 1
+        const labelFragment2 = /categories\s+selected\s+for\s+notification/i; // label line 2
+        const singleLineLabel = /relevant\s+categories/i;                    // non-wrapped layout
+        const prevFieldKeywords = /gemarpts|generated\s+in/i;                // field right before this one
+
+        const stopMarkers = [
+            /minimum\s+average\s+annual\s+turnover/i, // actual next field in real PDFs
+            /years\s+of\s+past\s+experience/i,
+            /mse\s+exemption/i,
+            /startup\s+exemption/i,
+            /document\s+required\s+from\s+seller/i,
+            /item\s+category/i,
+            /primary\s+product\s+category/i,
+            /technical\s+specifications/i,
+            /mse\s+relaxation/i,
+            /startup\s+relaxation/i
+        ];
+
+        // Find label fragment 1 (the common, wrapped-label case)
+        let idx1 = -1;
+        for (let i = 0; i < lines.length; i++) {
+            if (labelFragment1.test(lines[i])) { idx1 = i; break; }
+        }
+        // Fall back to a single-line, non-wrapped label (different PDF layout)
+        let singleLine = false;
+        if (idx1 === -1) {
+            for (let i = 0; i < lines.length; i++) {
+                if (singleLineLabel.test(lines[i])) { idx1 = i; singleLine = true; break; }
+            }
+        }
+        if (idx1 === -1) {
+            console.log('No Relevant Categories label found');
+            return 'Not Found';
+        }
+
+        // Confirm with label fragment 2, within a small window after fragment 1
+        let idx2 = -1;
+        if (!singleLine) {
+            for (let i = idx1 + 1; i < Math.min(lines.length, idx1 + 6); i++) {
+                if (labelFragment2.test(lines[i])) { idx2 = i; break; }
+            }
+        }
+
+        // End boundary: nearest real stop marker after the label
+        const searchFrom = idx2 !== -1 ? idx2 : idx1;
+        let endIdx = lines.length;
+        for (let i = searchFrom + 1; i < lines.length; i++) {
+            if (stopMarkers.some(p => p.test(lines[i]))) { endIdx = i; break; }
+        }
+
+        // Start boundary: a small fixed look-back before the label (covers value lines
+        // that got centered ahead of it), stopping early at the previous field's own text
+        const LOOKBACK = 2;
+        let startIdx = idx1;
+        for (let i = idx1 - 1; i >= Math.max(0, idx1 - LOOKBACK); i--) {
+            if (prevFieldKeywords.test(lines[i])) break;
+            startIdx = i;
+        }
+
+        const valueParts = [];
+        for (let i = startIdx; i < endIdx; i++) {
+            const line = lines[i];
+            if (labelFragment1.test(line)) continue;
+            if (labelFragment2.test(line)) continue;
+            if (singleLine && i === idx1) continue;
+            if (prevFieldKeywords.test(line)) continue;
+            valueParts.push(line);
+        }
+
+        // Note: Devanagari stripping (and dropping any resulting empty lines) now
+        // happens centrally in extractDataFromText.
+        let value = valueParts.join('\n').trim();
+
+        if (value.length >= 2) {
+            console.log('Extracted Relevant Categories:', value);
+            return value;
+        }
+
+        console.log('Relevant Categories label found but no value captured');
+        return 'Not Found';
+    }
+
+
+    // REWRITTEN: extractTechnicalSpec - Now captures the actual inline "Technical
+    // Specifications" text from the bid document (works even when there is no
+    // hyperlink at all), and falls back to / appends the linked spec document URL
+    // (BOQ / Buyer Spec / GeM Category Specification) when one is present.
     extractTechnicalSpec(text) {
         console.log('\n=== EXTRACTING TECHNICAL SPECIFICATION ===');
-        
-        // If we have no extracted links, return early
+
+        const specText = this.extractTechnicalSpecText(text);
+        const specUrl = this.extractTechnicalSpecUrl();
+
+        if (specText && specUrl) {
+            console.log('✅ Found both inline spec text and a spec document URL');
+            return `${specText}\nDocument: ${specUrl}`;
+        }
+        if (specText) {
+            console.log('✅ Found inline technical specification text');
+            return specText;
+        }
+        if (specUrl) {
+            console.log('✅ Found technical specification document URL (no inline text)');
+            return specUrl;
+        }
+
+        console.log('❌ No technical specification found (text or URL)');
+        return 'Not Found';
+    }
+
+    // NEW: extractTechnicalSpecText - Generically extract the text of the "Technical
+    // Specifications" section of the bid, regardless of product category. Returns null
+    // when the section only contains a placeholder reference (e.g. "As per GeM Category
+    // Specification") pointing to an external document, so the caller can fall back to
+    // the URL instead of returning a near-empty string.
+    extractTechnicalSpecText(text) {
+        const startPatterns = [
+            'Technical Specifications/तकनीकी विशिष्टियाँ',
+            'Technical Specifications/',
+            'Technical Specifications',
+            'तकनीकी विशिष्टियाँ'
+        ];
+
+        const stopPatterns = [
+            'Consignees/Reporting Officer', 'Consignees', 'Buyer Added Bid',
+            'Input Tax Credit', 'EMD Detail', 'Evaluation Method', 'Inspection Required',
+            'Advisory', 'Experience Criteria', 'Preference to Make In India',
+            'Purchase preference for MSEs', 'Estimated Bid Value', 'Past Performance',
+            'Splitting', 'ePBG Detail', 'Additional Bid Documents',
+            'Buyer uploaded specification'
+        ];
+
+        let startIdx = -1;
+        let matchedStartLen = 0;
+        for (const pattern of startPatterns) {
+            const idx = text.indexOf(pattern);
+            if (idx !== -1 && (startIdx === -1 || idx < startIdx)) {
+                startIdx = idx;
+                matchedStartLen = pattern.length;
+            }
+        }
+
+        if (startIdx === -1) {
+            console.log('No Technical Specifications header found in text');
+            return null;
+        }
+
+        const afterStart = text.substring(startIdx + matchedStartLen);
+
+        let stopIdx = afterStart.length;
+        for (const pattern of stopPatterns) {
+            const idx = afterStart.indexOf(pattern);
+            if (idx !== -1 && idx < stopIdx) {
+                stopIdx = idx;
+            }
+        }
+
+        // Cap the section length as a safety net in case no stop pattern is found
+        const sectionText = afterStart.substring(0, Math.min(stopIdx, 3000));
+
+        // Patterns that indicate the section is just a placeholder pointing to a linked
+        // document rather than containing real spec text
+        const placeholderPatterns = [
+            'as per gem category specification',
+            'जेम केटेगरी विशिष्टि के अनुसार',
+            'जेम केटेगरी विशिष्टि'
+        ];
+
+        const rawLines = sectionText.split(/\n|\s{3,}/);
+        const cleanLines = [];
+
+        for (let line of rawLines) {
+            let lineClean = line.trim();
+            if (!lineClean || lineClean.length < 3) continue;
+            if (/^\d+\s*\/\s*\d+$/.test(lineClean)) continue; // page numbers
+            if (lineClean.startsWith('*')) lineClean = lineClean.replace(/^\*+\s*/, '');
+            if (!lineClean) continue;
+
+            lineClean = lineClean.replace(/\s+/g, ' ').trim();
+            // Drop a trailing fragment left over when the section text was cut mid-line
+            // right before a stop pattern (e.g. "...तथा मात्रा/" with "Consignees..." removed)
+            if (lineClean.endsWith('/') || lineClean.endsWith('-')) continue;
+
+            if (lineClean.length >= 3 && lineClean.length < 500) {
+                cleanLines.push(lineClean);
+            }
+        }
+
+        const uniqueLines = [...new Set(cleanLines)];
+
+        if (uniqueLines.length === 0) {
+            return null;
+        }
+
+        const combined = uniqueLines.join(' | ');
+        const lowerCombined = combined.toLowerCase();
+
+        // If every meaningful line is just the "as per GeM Category Specification"
+        // placeholder, treat as no inline text so we fall back to the linked document URL
+        const isPlaceholderOnly = placeholderPatterns.some(p => lowerCombined.includes(p)) &&
+            combined.length < 80;
+
+        if (isPlaceholderOnly) {
+            console.log('Technical Specifications section is only a placeholder reference:', combined);
+            return null;
+        }
+
+        console.log('Extracted Technical Specification text:', combined);
+        return uniqueLines.slice(0, 30).join(' | ');
+    }
+
+    // Renamed from the old extractTechnicalSpec: selects the best matching linked
+    // specification document URL (BOQ / Buyer Spec / GeM Category Specification)
+    extractTechnicalSpecUrl() {
         if (!this.pdfLinks || this.pdfLinks.length === 0) {
             console.log('❌ No links found in PDF');
-            return 'No technical specification URLs found';
+            return null;
         }
-        
-        // Show all found links and their types
+
         console.log(`📋 Found ${this.pdfLinks.length} links:`);
         this.pdfLinks.forEach((link, index) => {
             console.log(`  ${index + 1}. ${link.type}: ${link.url}`);
         });
-        
-        // Priority order for link types
+
         const linkPriority = [
             'BOQ Detail Document',
             'Buyer Specification Document',
             'GeM Category Specification'
         ];
-        
-        // Look for links in priority order
+
         for (const priority of linkPriority) {
             const link = this.pdfLinks.find(l => l.type === priority);
             if (link) {
@@ -1591,9 +1881,9 @@ class GeMBiddingDataExtractor {
                 return link.url;
             }
         }
-        
+
         console.log('❌ No technical specification URLs found');
-        return 'No technical specification URLs found';
+        return null;
     }
 
 
@@ -1668,8 +1958,7 @@ class GeMBiddingDataExtractor {
             // Create main data array with headers
             const headers = [
                 'BID Number', 'Ministry', 'Department', 'BID Start Date', 'BID End Date', 'Organization Name', 'Total Quantity', 
-                'Item Category', 'Searched Strings used in GeMARPTS', 'Searched Result generated in GeMARPTS',
-                'Relevant Categories selected for notification', 'BOQ Title', 'Technical Specification', 'Filename'
+                'Item Category', 'Primary Product Category', 'Relevant Categories', 'Technical Specification', 'Filename'
             ];
             
             const data = [headers];
@@ -1691,10 +1980,8 @@ class GeMBiddingDataExtractor {
                     row['Organization Name'] || '-',
                     row['Total Quantity'] || 'Not Found',
                     row['Item Category'] || 'Not Found',
-                    row['Searched Strings used in GeMARPTS'] || 'Not Found',
-                    row['Searched Result generated in GeMARPTS'] || 'Not Found',
-                    row['Relevant Categories selected for notification'] || 'Not Found',
-                    row['BOQ Title'] || 'Not Found',
+                    row['Primary Product Category'] || 'Not Found',
+                    row['Relevant Categories'] || 'Not Found',
                     techSpecCell, // Use the cell object with formula
                     row['Filename'] || 'Not Found'
                 ]);
@@ -1729,10 +2016,8 @@ class GeMBiddingDataExtractor {
                     row['Organization Name'] || '-',
                     row['Total Quantity'] || 'Not Found',
                     row['Item Category'] || 'Not Found',
-                    row['Searched Strings used in GeMARPTS'] || 'Not Found',
-                    row['Searched Result generated in GeMARPTS'] || 'Not Found',
-                    row['Relevant Categories selected for notification'] || 'Not Found',
-                    row['BOQ Title'] || 'Not Found',
+                    row['Primary Product Category'] || 'Not Found',
+                    row['Relevant Categories'] || 'Not Found',
                         techSpecCell,
                         row['Filename'] || 'Not Found'
                     ]);
@@ -1760,10 +2045,8 @@ class GeMBiddingDataExtractor {
                     row['Organization Name'] || '-',
                     row['Total Quantity'] || 'Not Found',
                     row['Item Category'] || 'Not Found',
-                    row['Searched Strings used in GeMARPTS'] || 'Not Found',
-                    row['Searched Result generated in GeMARPTS'] || 'Not Found',
-                    row['Relevant Categories selected for notification'] || 'Not Found',
-                    row['BOQ Title'] || 'Not Found',
+                    row['Primary Product Category'] || 'Not Found',
+                    row['Relevant Categories'] || 'Not Found',
                         techSpecCell,
                         row['Filename'] || 'Not Found'
                     ]);
@@ -1950,6 +2233,16 @@ class GeMBiddingDataExtractor {
                 const itemCount = data['Item Category'].split('\n').length;
                 summaryHTML += `<div class="summary-item"><span class="summary-label">Categories Found:</span><span class="summary-value">${itemCount} groups</span></div>`;
             }
+
+            // Show Primary Product Category / Relevant Categories if found
+            if (data['Primary Product Category'] && data['Primary Product Category'] !== 'Not Found') {
+                const value = data['Primary Product Category'].length > 30 ? data['Primary Product Category'].substring(0, 30) + '...' : data['Primary Product Category'];
+                summaryHTML += `<div class="summary-item"><span class="summary-label">Primary Product Category:</span><span class="summary-value">${value}</span></div>`;
+            }
+            if (data['Relevant Categories'] && data['Relevant Categories'] !== 'Not Found') {
+                const relCount = data['Relevant Categories'].split('\n').length;
+                summaryHTML += `<div class="summary-item"><span class="summary-label">Relevant Categories:</span><span class="summary-value">${relCount} found</span></div>`;
+            }
             
             if (index < this.extractedData.length - 1) {
                 summaryHTML += '<hr style="margin: 15px 0; border: none; border-top: 1px solid #e9ecef;">';
@@ -2004,6 +2297,12 @@ class GeMBiddingDataExtractor {
         if (data['Item Category'] === 'Not Found') {
             warnings.push('Item Category not found in document');
             isValid = false;
+        }
+        if (data['Primary Product Category'] === 'Not Found') {
+            warnings.push('Primary Product Category not found in document');
+        }
+        if (data['Relevant Categories'] === 'Not Found') {
+            warnings.push('Relevant Categories not found in document');
         }
 
         // Check for reasonable data lengths
