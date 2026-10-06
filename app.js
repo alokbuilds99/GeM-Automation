@@ -971,7 +971,10 @@ class GeMBiddingDataExtractor {
             'Organization Name': this.extractOrganizationName(text),
             'Total Quantity': this.extractTotalQuantity(text),
             'Item Category': this.extractItemCategory(text),
+            'Searched Strings used in GeMARPTS': this.extractGeMARPTSSearchedStrings(text),
             'Searched Result generated in GeMARPTS': this.extractGeMARPTSSearchedResult(text),
+            'Relevant Categories selected for notification': this.extractRelevantCategories(text),
+            'BOQ Title': this.extractBOQTitle(text),
             'Technical Specification': this.extractTechnicalSpec(text),
             'Filename': filename // NEW: Add filename as last column
         };
@@ -1425,26 +1428,52 @@ class GeMBiddingDataExtractor {
         return 'No items found - may be policy document or scanned image';
     }
 
-    // NEW FUNCTION: extractGeMARPTSSearchedResult - Value of the bid-details row
-    // "GeMARPTS में खोजा गया परिणाम / Searched Result generated in GeMARPTS"
-    extractGeMARPTSSearchedResult(text) {
-        // Anchor on the English half of the label only. The Hindi half often comes out of
-        // PDF.js with broken glyphs, so it cannot be matched reliably.
-        const labelRegex = /Searched\s+Results?\s+generated\s+in\s+GeM\s*ARPTS/gi;
+    // NEW FUNCTIONS: the four bid-details rows that sit together under Item Category
+    //   GeMARPTS में खोजी गई स्ट्रिंग / Searched Strings used in GeMARPTS
+    //   GeMARPTS में खोजा गया परिणाम / Searched Result generated in GeMARPTS
+    //   अधिसूचना के लिए चयनित प्रासंगिक श्रेणियाँ / Relevant Categories selected for notification
+    //   BOQ Title/बीओक्यू शीर्षक
+    // Each one matches on the English half of its label only: the Hindi half often comes out of
+    // PDF.js with broken glyphs, so it cannot be matched reliably.
+    extractGeMARPTSSearchedStrings(text) {
+        return this.extractBidDetailRow(text, 'Searched Strings used in GeMARPTS',
+            /Searched\s+Strings?\s+used\s+in\s+GeM\s*ARPTS/gi);
+    }
 
+    extractGeMARPTSSearchedResult(text) {
+        return this.extractBidDetailRow(text, 'Searched Result generated in GeMARPTS',
+            /Searched\s+Results?\s+generated\s+in\s+GeM\s*ARPTS/gi);
+    }
+
+    extractRelevantCategories(text) {
+        return this.extractBidDetailRow(text, 'Relevant Categories selected for notification',
+            /Relevant\s+Categor(?:y|ies)\s+selected\s+for\s+notification/gi);
+    }
+
+    extractBOQTitle(text) {
+        // This label is English-first, so its Hindi half sits between the label and the value
+        return this.extractBidDetailRow(text, 'BOQ Title', /BOQ\s+Title/gi,
+            { hindiAfterLabel: /^बीओक्यू\s+शीर्षक/ });
+    }
+
+    // Shared reader for a label/value row of the bid-details table: returns the text between
+    // the given label and the label of whichever row comes next.
+    extractBidDetailRow(text, fieldName, labelRegex, options = {}) {
         // Labels of the rows that can come next; the value ends at whichever appears first.
-        // The first two are written Hindi-first in the PDF, so their patterns also swallow the
+        // The first three are written Hindi-first in the PDF, so their patterns also swallow the
         // (possibly garbled) Hindi text sitting in front of the English words.
         const stopPatterns = [
-            /(?:(?:^|\s)[^\x00-\x7F][^A-Za-z0-9]*)?Relevant\s+Categor(?:y|ies)\s+selected\s+for\s+notification/i,
             /GeM\s*ARPTS[^A-Za-z0-9]*Searched\s+Strings?\s+used\s+in\s+GeM\s*ARPTS/i,
+            /GeM\s*ARPTS[^A-Za-z0-9]*Searched\s+Results?\s+generated\s+in\s+GeM\s*ARPTS/i,
+            /(?:(?:^|\s)[^\x00-\x7F][^A-Za-z0-9]*)?Relevant\s+Categor(?:y|ies)\s+selected\s+for\s+notification/i,
             /Searched\s+Strings?\s+used\s+in\s+GeM\s*ARPTS/i,
+            /Searched\s+Results?\s+generated\s+in\s+GeM\s*ARPTS/i,
             /BOQ\s+Title\s*\//i,
             /Item\s+Category\s*\//i,
             /Total\s+Quantity\s*\//i,
             /Contract\s+Period\s*\//i,
-            /MSE\s+Exemption\s+for\s+Years/i,
-            /Startup\s+Exemption\s+for\s+Years/i,
+            /MSE\s+(?:Exemption|Relaxation)\s+for\s+Years/i,
+            /Startup\s+(?:Exemption|Relaxation)\s+for\s+Years/i,
             /Minimum\s+Average\s+Annual\s+Turnover/i,
             /OEM\s+Average\s+Turnover/i,
             /Years\s+of\s+Past\s+Experience\s+Required/i,
@@ -1469,6 +1498,7 @@ class GeMBiddingDataExtractor {
         const windowSize = 2000;   // how far past the label to look for the next row
         const maxFallbackLength = 500;
 
+        labelRegex.lastIndex = 0;
         let labelMatch;
         while ((labelMatch = labelRegex.exec(text)) !== null) {
             const afterLabel = text.substr(labelMatch.index + labelMatch[0].length, windowSize);
@@ -1487,30 +1517,45 @@ class GeMBiddingDataExtractor {
                 value = afterLabel.substring(0, stopIndex);
             } else {
                 // No known label after it: take the rest of the page (pages are joined with \n)
-                console.log('GeMARPTS Searched Result: no following row label found, using rest of page');
-                value = afterLabel.split('\n')[0].substring(0, maxFallbackLength);
+                console.log(`${fieldName}: no following row label found, using rest of page`);
+                value = afterLabel.replace(/^\s+/, '').split('\n')[0].substring(0, maxFallbackLength);
             }
 
             // Tidy up: separators left over from the table cell, repeated whitespace
             value = value
                 .replace(/\s+/g, ' ')
-                .replace(/^[\s:\-–|]+/, '')
+                .replace(/^[\s:\-–|\/]+/, '')
                 .replace(/[\s:\/|]+$/, '')
                 .trim();
 
+            // English-first label: drop the Hindi half of the label from the front of the value
+            if (options.hindiAfterLabel) {
+                if (options.hindiAfterLabel.test(value)) {
+                    value = value.replace(options.hindiAfterLabel, '');
+                } else {
+                    // Garbled Hindi: drop leading words that contain non-English characters
+                    const words = value.split(' ');
+                    while (words.length > 0 && /[^\x00-\x7F]/.test(words[0])) {
+                        words.shift();
+                    }
+                    value = words.join(' ');
+                }
+                value = value.replace(/^[\s:\-–|\/]+/, '').trim();
+            }
+
             if (value.length > 0) {
-                console.log('Found GeMARPTS Searched Result:', value);
+                console.log(`Found ${fieldName}:`, value);
                 return value;
             }
         }
 
-        // Help diagnose PDFs where the row exists but the label came out in an unexpected shape
-        const hintIndex = text.search(/GeM\s*ARPTS/i);
+        // Help diagnose PDFs where the row exists but its label came out in an unexpected shape
+        const hintIndex = text.search(new RegExp(fieldName.split(' ')[0], 'i'));
         if (hintIndex !== -1) {
-            console.log('GeMARPTS text is present but no Searched Result value could be read. Nearby text:',
+            console.log(`${fieldName}: no value could be read. Nearby text:`,
                 text.substring(Math.max(0, hintIndex - 100), hintIndex + 400));
         } else {
-            console.log('No GeMARPTS section in this PDF');
+            console.log(`${fieldName}: row not present in this PDF`);
         }
         return 'Not Found';
     }
@@ -1623,7 +1668,8 @@ class GeMBiddingDataExtractor {
             // Create main data array with headers
             const headers = [
                 'BID Number', 'Ministry', 'Department', 'BID Start Date', 'BID End Date', 'Organization Name', 'Total Quantity', 
-                'Item Category', 'Searched Result generated in GeMARPTS', 'Technical Specification', 'Filename'
+                'Item Category', 'Searched Strings used in GeMARPTS', 'Searched Result generated in GeMARPTS',
+                'Relevant Categories selected for notification', 'BOQ Title', 'Technical Specification', 'Filename'
             ];
             
             const data = [headers];
@@ -1645,7 +1691,10 @@ class GeMBiddingDataExtractor {
                     row['Organization Name'] || '-',
                     row['Total Quantity'] || 'Not Found',
                     row['Item Category'] || 'Not Found',
+                    row['Searched Strings used in GeMARPTS'] || 'Not Found',
                     row['Searched Result generated in GeMARPTS'] || 'Not Found',
+                    row['Relevant Categories selected for notification'] || 'Not Found',
+                    row['BOQ Title'] || 'Not Found',
                     techSpecCell, // Use the cell object with formula
                     row['Filename'] || 'Not Found'
                 ]);
@@ -1680,7 +1729,10 @@ class GeMBiddingDataExtractor {
                     row['Organization Name'] || '-',
                     row['Total Quantity'] || 'Not Found',
                     row['Item Category'] || 'Not Found',
+                    row['Searched Strings used in GeMARPTS'] || 'Not Found',
                     row['Searched Result generated in GeMARPTS'] || 'Not Found',
+                    row['Relevant Categories selected for notification'] || 'Not Found',
+                    row['BOQ Title'] || 'Not Found',
                         techSpecCell,
                         row['Filename'] || 'Not Found'
                     ]);
@@ -1708,7 +1760,10 @@ class GeMBiddingDataExtractor {
                     row['Organization Name'] || '-',
                     row['Total Quantity'] || 'Not Found',
                     row['Item Category'] || 'Not Found',
+                    row['Searched Strings used in GeMARPTS'] || 'Not Found',
                     row['Searched Result generated in GeMARPTS'] || 'Not Found',
+                    row['Relevant Categories selected for notification'] || 'Not Found',
+                    row['BOQ Title'] || 'Not Found',
                         techSpecCell,
                         row['Filename'] || 'Not Found'
                     ]);
